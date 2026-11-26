@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Find hater messages anywhere on the canvas and cover every hater word with a small French flag
-exactly the size of the word, then keep those flags alive. Needs paint_flag.py alongside.
+"""OCR scanner: every --interval seconds, read all text on the canvas, find hater words, and add a
+flag rectangle for each new one to guarded.txt. It paints nothing: guard_flags.py, running next to
+it, re-reads guarded.txt every round and paints the flags. Needs paint_flag.py and guard_flags.py.
 
     sudo apt install tesseract-ocr          (macOS: brew install tesseract)
     pip install pytesseract scipy better-profanity numpy pillow requests
 
-    python3 cover_hate.py --dry-run         # list new words found, save cover_preview.png
-    python3 cover_hate.py --guard           # flag new words and repair all flags, until Ctrl-C
+    python3 scan_hate.py                    # scan every 20 s until Ctrl-C, appending to guarded.txt
+    python3 scan_hate.py --dry-run          # one scan: list new words, save scan_preview.png
 
-How it works:
+How it finds them:
   1. Text is found by shape: letter-like blobs of dark pixels (dark letters on a light
      background) and of light pixels (light letters with a dark outline, meme style). Noise
      dots and big areas are dropped, and tesseract reads what is left.
@@ -17,17 +18,11 @@ How it works:
      words (gay, trans, queer, ...) are never treated as hate on their own.
   3. Inside a hateful line, every hater word (HATE_KEYS, matched letter by letter with one
      misread letter allowed for words of 4+ letters, plus words on the profanity list) gets a
-     French flag (#002395 / #ffffff / #ed2939, vertical stripes) over its letters and their
-     outline, no more. Benign look-alikes ("GOOD LUCK") are never touched: the line must
-     first be hateful by the exact rules of step 2.
-  4. Every flag is recorded in guarded.txt ("x0 y0 x1 y1 word", one per line). At startup the
-     file is read back, and every round all recorded flags are repaired, so they stay alive
-     even if the hater pastes over them again. Delete a line to stop guarding that flag.
-  5. On our own art (MERCI flag, heart) a flag's pixels restore our colours instead, so this
-     script never fights the guards.
+     rectangle over its letters and their outline, no more. Benign look-alikes ("GOOD LUCK")
+     are never touched: the line must first be hateful by the exact rules of step 2.
+  4. A rectangle overlapping a flag already in guarded.txt is not added again.
 """
 import argparse, os, re, time
-from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pytesseract
@@ -36,9 +31,8 @@ from PIL import Image, ImageDraw
 from scipy import ndimage
 
 import paint_flag as engine
+from guard_flags import GUARDED, add_guarded, flag_target, load_guarded, overlap
 
-GUARDED = os.path.join(os.path.dirname(os.path.abspath(__file__)), "guarded.txt")
-FLAG = ["002395", "ffffff", "ed2939"]  # official French blue, white, red
 # hater words to cover; when several match, exact and longer matches win
 HATE_KEYS = ["DISGUSTING", "PATHETIC", "FUCKING", "GARBAGE", "FUCKED", "FUCKER", "HATERS", "LOSERS", "PHUCK", "SUCKS",
              "HATER", "HATES", "HATED", "DEATH", "LOSER", "TRASH", "FUCK", "SUCK", "HATE", "KILL", "STFU", "SCUM",
@@ -146,28 +140,25 @@ def find_hate_words(chars):
     return out
 
 
-def overlap(a, b):
-    return a[0] <= b[2] and b[0] <= a[2] and a[1] <= b[3] and b[1] <= a[3]
-
-
 def word_rect(board, ink, box, mode):
     """The word's letters plus their outline (light text) or 1 px (dark text): (x0, y0, x1, y1)."""
     H, W = board.shape[:2]
     x0, y0 = max(0, box[0] - 2), max(0, box[1] - 2)
-    ys, xs = np.nonzero(ink[y0:box[3] + 3, x0:box[2] + 3])
+    sub = ink[y0:box[3] + 3, x0:box[2] + 3]
+    # keep only letter-height blobs: the tallest blobs are the letters; stars or specks touching
+    # the word are much shorter and are left out of the flag
+    lab, n = ndimage.label(sub, structure=np.ones((3, 3)))
+    objs = ndimage.find_objects(lab)
+    if not objs:
+        return None
+    tallest = max(o[0].stop - o[0].start for o in objs if o is not None)
+    letters = np.isin(lab, [i + 1 for i, o in enumerate(objs) if o is not None and o[0].stop - o[0].start >= 0.6 * tallest])
+    ys, xs = np.nonzero(letters)
     if len(xs) < 6:
         return None
     m = (2 if ys.max() - ys.min() >= 26 else 1) + 1 if mode == "light" else 1
     return (int(max(0, x0 + xs.min() - m)), int(max(0, y0 + ys.min() - m)),
             int(min(W - 1, x0 + xs.max() + m)), int(min(H - 1, y0 + ys.max() + m)))
-
-
-def flag_target(rect, ours):
-    """[(x, y, colour)]: a French flag filling `rect`, or our own art's colours where it lies on it."""
-    x0, y0, x1, y1 = rect
-    w = x1 - x0 + 1
-    return [(x, y, ours.get((x, y)) or FLAG[min(2, 3 * (x - x0) // w)])
-            for y in range(y0, y1 + 1) for x in range(x0, x1 + 1)]
 
 
 def find_words(board, min_conf=60):
@@ -196,87 +187,48 @@ def find_words(board, min_conf=60):
     return found
 
 
-def load_guarded():
-    rects = []
-    if os.path.exists(GUARDED):
-        for line in open(GUARDED):
-            parts = line.split("#")[0].split()
-            if len(parts) >= 4:
-                rects.append((tuple(int(v) for v in parts[:4]), " ".join(parts[4:])))
-    return rects
-
-
-def add_guarded(rect, word):
-    new = not os.path.exists(GUARDED)
-    with open(GUARDED, "a") as f:
-        if new:
-            f.write("# small French flags covering hater words, kept alive by cover_hate.py\n"
-                    "# x0 y0 x1 y1 word   (delete a line to stop guarding that flag)\n")
-        f.write(f"{rect[0]} {rect[1]} {rect[2]} {rect[3]} {word}  # {time.strftime('%Y-%m-%d %H:%M')}\n")
-
-
-def our_art():
-    """{(x, y): colour} of our own art: flags there restore our colours (no fights with the guards)."""
-    import paint_merci_flag, paint_heart
-    ours = {(x, y): c for x, y, c in paint_merci_flag.merci_pixels()}
-    ours.update({(x, y): c for x, y, c in paint_heart.heart_pixels(1001, 494)})
-    return ours
-
-
 def main():
-    ap = argparse.ArgumentParser(description="Cover hater words with small French flags and keep them alive.")
-    ap.add_argument("--dry-run", action="store_true", help="only list new words, save cover_preview.png")
-    ap.add_argument("--guard", action="store_true", help="keep scanning and repairing until Ctrl-C")
-    ap.add_argument("--interval", type=float, default=20)
+    ap = argparse.ArgumentParser(description="Find hater words on the canvas and add flags for them to guarded.txt.")
+    ap.add_argument("--interval", type=float, default=20, help="seconds between scans")
+    ap.add_argument("--once", action="store_true", help="a single scan")
+    ap.add_argument("--dry-run", action="store_true", help="one scan, list new words, save scan_preview.png")
+    ap.add_argument("--file", default=GUARDED, help="flag list to append to (default guarded.txt)")
     ap.add_argument("--min-conf", type=float, default=60, help="minimum OCR confidence (0-100) per word")
-    ap.add_argument("--no-ours", action="store_true", help="paint flags even over our own art")
-    ap.add_argument("--workers", type=int, default=min(256, 16 * (os.cpu_count() or 4)))
-    ap.add_argument("--max-bits", type=int, default=12)
-    ap.add_argument("--name", default=os.environ.get("NAME", "tricolore"))
     args = ap.parse_args()
-    ours = {} if args.no_ours else our_art()
-    guarded = load_guarded()
-
-    cfg = engine.requests.get(f"{engine.BASE}/api/config", timeout=20).json()
-    engine._init(cfg["pow_kib"], args.max_bits, args.name)
-    print(f"hashing with {engine.backend()}, {args.workers} workers, {len(guarded)} flag(s) in {GUARDED}", flush=True)
-    with ThreadPoolExecutor(args.workers) as pool:
-        while True:
-            t = time.time()
+    print(f"scanning every {args.interval:g} s, writing to {args.file}", flush=True)
+    while True:
+        t = time.time()
+        try:
             w, raw = engine.fetch_board()
-            board = np.frombuffer(raw, dtype=np.uint8).reshape(-1, w, 3)
-            new = []
-            for word, rect in find_words(board, args.min_conf):
-                if not any(overlap(rect, r) for r, _ in guarded + new):
-                    new.append((rect, word))
-            stamp = time.strftime("%H:%M:%S")
-            for rect, word in new:
-                print(f"[{stamp}] new hater word {word!r} at {rect} -> flag", flush=True)
-                if not args.dry_run:
-                    add_guarded(rect, word)
-            if not args.dry_run:
-                guarded += new
-            flags = guarded + (new if args.dry_run else [])
-            todo = [(x, y, c) for rect, _ in flags for x, y, c in flag_target(rect, ours)
-                    if board[y, x].tobytes().hex() != c]
-            print(f"[{stamp}] scan {time.time() - t:.0f}s: {len(new)} new, {len(flags)} flag(s), "
-                  f"{len(todo)} px to paint", flush=True)
-            if args.dry_run:
-                prev = Image.fromarray(board.copy())
-                for x, y, c in todo:
-                    prev.putpixel((x, y), tuple(bytes.fromhex(c)))
-                d = ImageDraw.Draw(prev)
-                for rect, _ in new:
-                    d.rectangle([rect[0] - 1, rect[1] - 1, rect[2] + 1, rect[3] + 1], outline=(255, 0, 255))
-                prev.save("cover_preview.png")
-                print("preview saved to cover_preview.png (magenta = new flags); guarded.txt not changed")
-                return
-            if todo:
-                counts = engine.run_pass(pool, engine.prioritize(todo), "  painting flags")
-                print(f"  painted {counts.get('ok', 0)}, deferred {counts.get('deferred', 0)}", flush=True)
-            if not args.guard:
-                return
+        except engine.requests.RequestException as e:
+            print(f"board fetch failed ({e}), retrying", flush=True)
             time.sleep(args.interval)
+            continue
+        board = np.frombuffer(raw, dtype=np.uint8).reshape(-1, w, 3)
+        known = [r for r, _ in load_guarded(args.file)]
+        new = []
+        for word, rect in find_words(board, args.min_conf):
+            if not any(overlap(rect, r) for r in known + [n for n, _ in new]):
+                new.append((rect, word))
+        stamp = time.strftime("%H:%M:%S")
+        for rect, word in new:
+            print(f"[{stamp}] hater word {word!r} at {rect}" + ("" if args.dry_run else " -> added to guarded.txt"),
+                  flush=True)
+            if not args.dry_run:
+                add_guarded(rect, word, args.file)
+        print(f"[{stamp}] scan {time.time() - t:.0f}s: {len(new)} new, {len(known) + len(new)} flag(s) listed", flush=True)
+        if args.dry_run:
+            prev = Image.fromarray(board.copy())
+            for rect, _ in new:
+                for x, y, c in flag_target(rect, {}):
+                    prev.putpixel((x, y), tuple(bytes.fromhex(c)))
+                ImageDraw.Draw(prev).rectangle([rect[0] - 1, rect[1] - 1, rect[2] + 1, rect[3] + 1], outline=(255, 0, 255))
+            prev.save("scan_preview.png")
+            print("preview saved to scan_preview.png; guarded.txt not changed")
+            return
+        if args.once:
+            return
+        time.sleep(max(0.0, args.interval - (time.time() - t)))
 
 
 if __name__ == "__main__":

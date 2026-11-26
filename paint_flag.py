@@ -303,14 +303,19 @@ def main():
 
 
 def run(pixels, args, what):
-    """Paint `pixels` [(x, y, 'rrggbb')] once (--fix: only damaged ones), or guard them (--guard)."""
+    """Paint `pixels` [(x, y, 'rrggbb')] once (--fix: only damaged ones), or guard them (--guard).
+    `pixels` may also be a function returning that list: it is called again every guard round,
+    so the art can change while the guard runs (guard_flags.py re-reads guarded.txt this way)."""
     cfg = requests.get(f"{BASE}/api/config", timeout=20).json()
     if cfg.get("read_only"):
         sys.exit("board is read-only")
     _init(cfg["pow_kib"], args.max_bits, args.name)
-    if getattr(args, "shard", "0/1") != "0/1":
-        pixels = shard(pixels, args.shard)
-        what += f", shard {args.shard} ({len(pixels)} px)"
+    spec = getattr(args, "shard", "0/1")
+    source = pixels if callable(pixels) else (lambda: pixels)
+    current = (lambda: shard(source(), spec)) if spec != "0/1" else source
+    pixels = current()
+    if spec != "0/1":
+        what += f", shard {spec} ({len(pixels)} px)"
     print(f"{what}, name {args.name!r}, {args.workers} workers, hashing with {backend()}", flush=True)
 
     # Threads, not processes: a worker mostly waits on the network, and the hashing (C library,
@@ -328,12 +333,13 @@ def run(pixels, args, what):
                     if requests.get(f"{BASE}/api/config", timeout=20).json().get("read_only"):
                         print("board is read-only now: stopping", flush=True)
                         return
-                    tasks = damaged(pixels)
+                    pixels = current()
+                    tasks = damaged(pixels) if pixels else []
                 except requests.RequestException as e:
                     print(f"round {rnd}: board fetch failed ({e}), retrying", flush=True)
                     time.sleep(args.interval)
                     continue
-                intact = 100 * (len(pixels) - len(tasks)) / len(pixels)
+                intact = 100 * (len(pixels) - len(tasks)) / max(1, len(pixels))
                 stamp = time.strftime("%H:%M:%S")
                 batch = getattr(args, "batch", 0)
                 more = bool(batch) and len(tasks) > batch
@@ -341,8 +347,10 @@ def run(pixels, args, what):
                     tasks = prioritize(tasks)[:batch] if more else prioritize(tasks)
                     counts = run_pass(pool, tasks, f"[{stamp}] round {rnd}, {intact:.1f}% intact")
                     print(f"  repaired {counts.get('ok', 0)}, deferred {counts.get('deferred', 0)}", flush=True)
+                elif pixels:
+                    print(f"[{stamp}] round {rnd}: 100% intact", flush=True)
                 else:
-                    print(f"[{stamp}] round {rnd}: flag 100% intact", flush=True)
+                    print(f"[{stamp}] round {rnd}: nothing to guard yet", flush=True)
                 if not more:  # a full batch means more damage is waiting: rescan right away
                     time.sleep(args.interval)
         except KeyboardInterrupt:
