@@ -12,6 +12,8 @@ guarded.txt: one zone per line, board coordinates (inclusive); everything after 
     x0 y0 x1 y1 white note                              plain white
     x0 y0 x1 y1 text fg=ffffff ol=000000 bg=none TEXT   TEXT as big as fits in the box, centred;
                                                         "|" starts a new line
+    x0 y0 x1 y1 chat note                               where chat_to_board.py shows the live chat
+                                                        (painted by it, not by this script)
     x0 y0 x1 y1 off ...                                 any zone, kept in the list but not painted
   fg = text colour, ol = outline colour or none, bg = background colour or none (letters only).
 Delete a line to stop guarding that zone. Where a zone lies on our own art (MERCI flag, heart)
@@ -25,7 +27,7 @@ from paint_flag import run
 
 GUARDED = os.path.join(os.path.dirname(os.path.abspath(__file__)), "guarded.txt")
 FLAG = ["002395", "ffffff", "ed2939"]  # official French blue, white, red
-KINDS = ("flag", "white", "text")
+KINDS = ("flag", "white", "text", "chat")
 OPT_KEYS = ("fg", "ol", "bg")
 TEXT_DEFAULTS = {"fg": "ffffff", "ol": "000000", "bg": "none"}
 
@@ -210,6 +212,8 @@ def text_masks(text, w, h, outline):
 
 def zone_target(zone, ours):
     """[(x, y, colour)] the zone should show; our own art keeps its colours."""
+    if zone.kind == "chat":  # chat_to_board.py paints it
+        return []
     if zone.kind != "text":
         return flag_target(zone.rect, ours, zone.kind)
     o = {**TEXT_DEFAULTS, **zone.opts}

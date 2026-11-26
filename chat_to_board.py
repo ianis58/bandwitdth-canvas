@@ -4,10 +4,14 @@ board. Needs paint_flag.py and hate_words.py in the same folder.
 
     pip install -U yt-dlp pillow numpy requests better-profanity
 
-    python3 chat_to_board.py URL --rect 600 860 1010 1010 --dry-run   # preview, no painting
-    python3 chat_to_board.py URL --rect 600 860 1010 1010             # paint and keep it updated
-    python3 chat_to_board.py URL --rect ... --cookies-from-browser firefox   # if YouTube asks to sign in
-    python3 chat_to_board.py --demo --rect 600 860 1010 1010 --dry-run   # fake messages
+    python3 chat_to_board.py URL --dry-run                  # finds a spot, previews, paints nothing
+    python3 chat_to_board.py URL                            # paint and keep it updated
+    python3 chat_to_board.py URL --cookies-from-browser firefox   # if YouTube asks to sign in
+    python3 chat_to_board.py --demo --dry-run               # fake messages
+
+Where: a "chat" zone drawn in flag_ui.py (re-read every round: move it there and the panel
+follows), else --rect X0 Y0 X1 Y1, else (--rect auto, the default) the spot covering the least
+art, chosen at the first start and kept in chat_rect.txt (--new-spot to choose again).
 
 How it works:
   - Messages are read with yt-dlp (default; keep it updated with pip install -U yt-dlp), which
@@ -16,8 +20,9 @@ How it works:
     your own browser's YouTube cookies, or --cookies FILE. Other readers: --reader
     chat-downloader, or the official YouTube Data API with --api-key (a Google Cloud key with
     the YouTube Data API v3 enabled).
-  - Each message becomes one line "author: message" in small crisp text: author in French blue,
-    message in black, on white. The panel is a ring of line slots: a new message replaces the
+  - The last --lines messages (3) are shown, one line "author: message" each, in a 5x7 pixel
+    font (8 px per line, see pixfont.py; --font ttf --font-size N for a normal font): author in
+    French blue, message in black, on white. The panel is a ring of line slots: a new message replaces the
     oldest line and gets the ">" marker, so each message costs about one line of pixels (a
     scrolling chat would repaint the whole panel for every message).
   - Messages that are hateful by the same rules as scan_hate.py (profanity, slurs, hostile
@@ -33,6 +38,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 import paint_flag as engine
+import pixfont
 from hate_words import hateful
 
 AUTHOR, TEXT, BG, MARK = (0x00, 0x23, 0x95), (0, 0, 0), (255, 255, 255), (0xed, 0x29, 0x39)
@@ -154,60 +160,117 @@ def read_youtube_api(url, key, out):
 
 
 def read_demo(out):
+    """Fake chat: a few quick messages, then one every few seconds, forever."""
     samples = [("Marie", "Vive la France !"), ("Tom_42", "the croissant flag was so good"),
                ("Lukas", "hello from Germany"), ("hater99", "france sucks"),
                ("Ana", "bonjour tout le monde \U0001f1eb\U0001f1f7"), ("rix", "MERCI"),
                ("Jules", "look https://example.com/x"), ("Zoé", "allez les bleus")]
-    for author, msg in samples:
-        out.put((author, msg))
-        time.sleep(random.uniform(0.2, 0.6))
+    for i in range(10 ** 9):
+        out.put(samples[i % len(samples)])
+        time.sleep(random.uniform(0.2, 0.6) if i < len(samples) else random.uniform(2, 4))
 
 
 class Panel:
     """A ring of text lines: new messages replace the oldest line and get the '>' marker."""
 
-    def __init__(self, w, h, size):
-        self.w, self.h, self.font = w, h, font(size)
-        asc, desc = self.font.getmetrics()
-        self.line_h = asc + desc + 1
-        self.rows = max(1, (h - 2) // self.line_h)
-        self.slots, self.newest = [None] * self.rows, -1
+    def __init__(self, w, rows, font_kind="pixel", size=10):
+        self.w, self.rows, self.kind = w, rows, font_kind
+        if font_kind == "pixel":
+            self.line_h = pixfont.HEIGHT + 1
+        else:
+            self.font = font(size)
+            asc, desc = self.font.getmetrics()
+            self.line_h = asc + desc + 1
+        self.h = rows * self.line_h + 1
+        self.slots, self.newest = [None] * rows, -1
 
     def add(self, author, msg):
         self.newest = (self.newest + 1) % self.rows
         self.slots[self.newest] = (author, msg)
 
+    def length(self, text):
+        return pixfont.width(text) if self.kind == "pixel" else self.font.getlength(text)
+
     def fit(self, text, width):
-        if self.font.getlength(text) <= width:
+        if self.kind == "pixel":
+            text = pixfont.to_ascii(text)
+        if self.length(text) <= width:
             return text
-        while text and self.font.getlength(text + "..") > width:
+        while text and self.length(text + "..") > width:
             text = text[:-1]
         return text + ".."
 
     def render(self):
         img = Image.new("RGB", (self.w, self.h), BG)
+        arr = np.array(img)
         d = ImageDraw.Draw(img)
         d.fontmode = "1"  # crisp pixels, no anti-aliasing
-        mark_w = self.font.getlength("> ")
+        mark_w = self.length("> ")
         for i, slot in enumerate(self.slots):
             if not slot:
                 continue
             y = 1 + i * self.line_h
-            if i == self.newest:
-                d.text((2, y), ">", font=self.font, fill=MARK)
-            author = self.fit(slot[0], self.w * 0.35) + ": "
-            d.text((2 + mark_w, y), author, font=self.font, fill=AUTHOR)
-            x = 2 + mark_w + self.font.getlength(author)
-            d.text((x, y), self.fit(slot[1], self.w - x - 2), font=self.font, fill=TEXT)
-        return np.array(img)
+            author = self.fit(slot[0], self.w * 0.3) + ": "
+            x = 2 + mark_w + self.length(author)
+            msg = self.fit(slot[1], self.w - x - 2)
+            if self.kind == "pixel":
+                if i == self.newest:
+                    pixfont.draw(arr, 2, y, ">", MARK)
+                pixfont.draw(arr, 2 + mark_w, y, author, AUTHOR)
+                pixfont.draw(arr, x, y, msg, TEXT)
+            else:
+                if i == self.newest:
+                    d.text((2, y), ">", font=self.font, fill=MARK)
+                d.text((2 + mark_w, y), author, font=self.font, fill=AUTHOR)
+                d.text((x, y), msg, font=self.font, fill=TEXT)
+        return arr if self.kind == "pixel" else np.array(img)
+
+
+SPOT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chat_rect.txt")
+
+
+def find_spot(board, w, h, step=2):
+    """(x0, y0, x1, y1) of the w x h spot that is the most white already (cheapest to paint, covers
+    no art: letter strokes, lines and drawings count 8x more than noise dots), away from guarded.txt
+    zones and our own art."""
+    H, W = board.shape[:2]
+    nonwhite = (board != 255).any(axis=2)
+    # pixels that are part of something (a letter stroke, a line, a drawing: 2+ non-white neighbours)
+    # weigh 8x more than isolated noise dots, so text and art are avoided, noise is not
+    from scipy.ndimage import convolve
+    k = np.ones((3, 3), np.int32)
+    k[1, 1] = 0
+    structure = nonwhite & (convolve(nonwhite.astype(np.int32), k, mode="constant") >= 2)
+    busy = nonwhite.astype(np.int32) + 7 * structure
+    try:
+        from guard_flags import load_guarded, our_art
+        for z in load_guarded():
+            x0, y0, x1, y1 = z.rect
+            busy[max(0, y0 - 3):y1 + 4, max(0, x0 - 3):x1 + 4] = 10 ** 6  # never on (or touching) a zone
+        for (x, y) in our_art():
+            busy[y, x] = 10 ** 6
+    except ImportError:
+        pass
+    ii = np.pad(busy.cumsum(0).cumsum(1), ((1, 0), (1, 0)))
+    best = None
+    for y in range(2, H - h - 2, step):
+        row = ii[y + h, w + 2:W - 1] - ii[y, w + 2:W - 1] - ii[y + h, 2:W - w - 1] + ii[y, 2:W - w - 1]
+        x = int(np.argmin(row[::step]) * step)
+        if best is None or row[x] < best[0]:
+            best = (int(row[x]), x + 2, y)
+    return (best[1], best[2], best[1] + w - 1, best[2] + h - 1), best[0]
 
 
 def main():
     ap = argparse.ArgumentParser(description="Show a YouTube live chat in a panel on the canvas.")
     ap.add_argument("url", nargs="?", default="https://www.youtube.com/watch?v=cyZS5gfil0E")
-    ap.add_argument("--rect", type=int, nargs=4, required=True, metavar=("X0", "Y0", "X1", "Y1"),
-                    help="chat panel on the board (inclusive); flag_ui.py helps to find a free area")
-    ap.add_argument("--font-size", type=int, default=10)
+    ap.add_argument("--rect", nargs="+", default=["auto"], metavar="X0 Y0 X1 Y1",
+                    help="panel position (inclusive), or 'auto' (default): whitest free spot, kept in chat_rect.txt")
+    ap.add_argument("--new-spot", action="store_true", help="with --rect auto: choose a new spot")
+    ap.add_argument("--lines", type=int, default=3, help="how many messages to show")
+    ap.add_argument("--width", type=int, default=300, help="panel width for --rect auto")
+    ap.add_argument("--font", choices=["pixel", "ttf"], default="pixel", help="5x7 pixel font, or a normal font")
+    ap.add_argument("--font-size", type=int, default=10, help="size of the normal font (--font ttf)")
     ap.add_argument("--reader", choices=["yt-dlp", "chat-downloader", "api"], default="yt-dlp",
                     help="how to read the chat (api needs --api-key)")
     ap.add_argument("--cookies-from-browser", metavar="BROWSER",
@@ -222,9 +285,43 @@ def main():
     ap.add_argument("--max-bits", type=int, default=11)
     ap.add_argument("--name", default=os.environ.get("NAME", "tricolore"))
     args = ap.parse_args()
-    x0, y0, x1, y1 = args.rect
-    panel = Panel(x1 - x0 + 1, y1 - y0 + 1, args.font_size)
-    print(f"chat panel {panel.w}x{panel.h} at ({x0},{y0}): {panel.rows} lines", flush=True)
+    from guard_flags import load_guarded
+
+    def chat_zone():
+        """The chat zone drawn in flag_ui.py, if any (with --rect auto only)."""
+        if args.rect != ["auto"]:
+            return None
+        return next((z.rect for z in load_guarded() if z.kind == "chat" and z.enabled), None)
+
+    if args.rect != ["auto"]:
+        x0, y0, x1, y1 = (int(v) for v in args.rect)
+        panel = Panel(x1 - x0 + 1, args.lines, args.font, args.font_size)
+        y1 = y0 + panel.h - 1  # the height follows the lines and the font
+    elif chat_zone():
+        x0, y0, x1, _ = chat_zone()
+        panel = Panel(x1 - x0 + 1, args.lines, args.font, args.font_size)
+        y1 = y0 + panel.h - 1
+        print("using the chat zone from guarded.txt (move it in flag_ui.py, the panel follows)", flush=True)
+    else:
+        panel = Panel(args.width, args.lines, args.font, args.font_size)
+        saved = None
+        if os.path.exists(SPOT_FILE) and not args.new_spot:
+            try:
+                saved = tuple(int(v) for v in open(SPOT_FILE).read().split()[:4])
+            except ValueError:
+                saved = None
+        if saved and saved[2] - saved[0] + 1 == panel.w and saved[3] - saved[1] + 1 == panel.h:
+            x0, y0, x1, y1 = saved
+            print(f"reusing the spot in {SPOT_FILE}", flush=True)
+        else:
+            w, raw = engine.fetch_board()
+            (x0, y0, x1, y1), busy = find_spot(np.frombuffer(raw, dtype=np.uint8).reshape(-1, w, 3), panel.w, panel.h)
+            print(f"chose the whitest free spot ({busy} non-white pixels under it)", flush=True)
+            if not args.dry_run:
+                with open(SPOT_FILE, "w") as f:
+                    f.write(f"{x0} {y0} {x1} {y1}\n")
+    print(f"chat panel {panel.w}x{panel.h} at ({x0},{y0})-({x1},{y1}): {panel.rows} lines "
+          f"(--rect {x0} {y0} {x1} {y1} to reuse it)", flush=True)
 
     msgs = queue.Queue()
     cookie_args = (["--cookies-from-browser", args.cookies_from_browser] if args.cookies_from_browser else []) + \
@@ -263,6 +360,11 @@ def main():
                 panel.add(author or "?", msg)
                 shown += 1
                 print(f"  {author}: {msg}", flush=True)
+            moved = chat_zone()
+            if moved and (moved[0], moved[1], moved[2]) != (x0, y0, x1):
+                x0, y0, x1 = moved[0], moved[1], moved[2]
+                panel.w, y1 = x1 - x0 + 1, moved[1] + panel.h - 1
+                print(f"chat zone moved: panel now at ({x0},{y0})-({x1},{y1})", flush=True)
             target = panel.render()
             w, raw = engine.fetch_board()
             board = np.frombuffer(raw, dtype=np.uint8).reshape(-1, w, 3)

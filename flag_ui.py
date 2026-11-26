@@ -8,7 +8,8 @@ guard_flags.py paints your changes on its next round. Needs paint_flag.py and gu
     pip install websockets             (optional: live view; without it the board reloads every 10 s)
     python3 flag_ui.py                 # --file to use another list, --refresh 10 (seconds)
 
-Mouse: drag on empty board = new zone of the type chosen in the toolbar (Flag / White / Text);
+Mouse: drag on empty board = new zone of the type chosen in the toolbar (Flag / White / Text /
+       Chat: where chat_to_board.py shows the live chat, one chat zone, 3 lines high);
        drag a zone = move it; drag the square handle of the selected zone = resize it (a text zone
        re-fits its text); the buttons above the selected zone switch its painting on/off or
        delete it; right-click a zone = delete it; wheel = zoom where the mouse is; middle-drag = pan.
@@ -28,12 +29,14 @@ import numpy as np
 from PIL import Image, ImageTk
 
 import paint_flag as engine
+import pixfont
 from guard_flags import (GUARDED, add_guarded, load_guarded, move_guarded, our_art, remove_guarded,
                          set_enabled, zone_target)
 
 COLOURS = {"white": "ffffff", "black": "000000", "French blue": "002395", "French red": "ed2939",
            "gold": "ffd700", "none": "none"}
-DASH = {"flag": "", "white": (6, 3), "text": (2, 2)}
+DASH = {"flag": "", "white": (6, 3), "text": (2, 2), "chat": (8, 2, 2, 2)}
+CHAT_H = 3 * 8 + 1  # chat_to_board.py: 3 lines of the 5x7 pixel font
 WS_URL = engine.BASE.replace("https://", "wss://").replace("http://", "ws://") + "/api/ws"
 
 
@@ -83,7 +86,7 @@ class FlagUI:
         tk.Button(bar, text="Zoom +", command=lambda: self.set_zoom(self.zoom + 1)).pack(side="left")
         self.kind = tk.StringVar(value="flag")
         tk.Label(bar, text="  New zone:").pack(side="left")
-        for kind in ("flag", "white", "text"):
+        for kind in ("flag", "white", "text", "chat"):
             tk.Radiobutton(bar, text=kind.capitalize(), variable=self.kind, value=kind).pack(side="left")
         self.preview = tk.BooleanVar(value=True)
         tk.Checkbutton(bar, text="Preview", variable=self.preview, command=self.recompose).pack(side="left", padx=6)
@@ -206,11 +209,26 @@ class FlagUI:
         self.root.after(250, self.poll)
 
     # ---------------------------------------------------------------- zones
+    @staticmethod
+    def chat_sample(zone):
+        """What a chat zone will look like (chat_to_board.py paints it): 3 sample lines."""
+        x0, y0, x1, _ = zone.rect
+        w = x1 - x0 + 1
+        img = np.full((CHAT_H, w, 3), 255, np.uint8)
+        for i, (who, msg) in enumerate((("Marie", "Vive la France !"), ("Tom_42", "the croissant flag was so good"),
+                                        ("Zoe", "allez les bleus"))):
+            if i == 2:
+                pixfont.draw(img, 2, 1 + i * 8, ">", (0xed, 0x29, 0x39))
+            x = pixfont.draw(img, 14, 1 + i * 8, who + ": ", (0x00, 0x23, 0x95))
+            pixfont.draw(img, x, 1 + i * 8, msg, (0, 0, 0))
+        ys, xs = np.mgrid[0:CHAT_H, 0:w]
+        return [(x0 + int(x), y0 + int(y), img[y, x].tobytes().hex()) for y, x in zip(ys.ravel(), xs.ravel())]
+
     def arrays(self, zone):
         """(xs, ys, colours) numpy arrays of the zone's target, cached per zone."""
         k = zone.key()
         if k not in self.cache:
-            t = zone_target(zone, self.ours)
+            t = self.chat_sample(zone) if zone.kind == "chat" else zone_target(zone, self.ours)
             if t:
                 xs, ys, cs = zip(*t)
                 self.cache[k] = (np.array(xs), np.array(ys),
@@ -234,7 +252,7 @@ class FlagUI:
     def update_state(self):
         self.state = {}
         for z in self.zones:
-            if z.enabled:
+            if z.enabled and z.kind != "chat":  # the chat panel's content is not known here
                 xs, ys, cs = self.arrays(z)
                 self.state[z.rect] = bool((self.board[ys, xs] == cs).all()) if len(xs) else True
 
@@ -326,10 +344,11 @@ class FlagUI:
     def update_status(self):
         bad = sum(1 for v in self.state.values() if v is False)
         off = sum(1 for zn in self.zones if not zn.enabled)
-        kinds = {k: sum(1 for zn in self.zones if zn.kind == k) for k in ("flag", "white", "text")}
+        kinds = {k: sum(1 for zn in self.zones if zn.kind == k) for k in ("flag", "white", "text", "chat")}
         mode = "live" if self.live else f"reload every {self.refresh:g} s"
         self.status.config(text=f"{kinds['flag']} flag, {kinds['white']} white, {kinds['text']} text zone(s), "
-                                f"{bad} damaged, {off} off   {mode}, full {self.last}   zoom {self.zoom}x")
+                                f"{'chat panel placed, ' if kinds['chat'] else ''}{bad} damaged, {off} off   "
+                                f"{mode}, full {self.last}   zoom {self.zoom}x")
 
     # ---------------------------------------------------------------- mouse
     def board_xy(self, e):
@@ -376,7 +395,12 @@ class FlagUI:
             dx = max(-rect[0], min(W - 1 - rect[2], x - sx))
             dy = max(-rect[1], min(H - 1 - rect[3], y - sy))
             return (rect[0] + dx, rect[1] + dy, rect[2] + dx, rect[3] + dy)
+        if self.zone_kind(rect) == "chat":  # a chat zone only changes width: its height is 3 lines
+            return (rect[0], rect[1], max(rect[0] + 40, x), rect[1] + CHAT_H - 1)
         return (rect[0], rect[1], max(rect[0] + 2, x), max(rect[1] + 2, y))  # resize from the corner
+
+    def zone_kind(self, rect):
+        return next((z.kind for z in self.zones if z.rect == rect), None)
 
     def on_drag(self, e):
         if not self.drag or self.board is None:
@@ -402,7 +426,13 @@ class FlagUI:
         if rect[2] - rect[0] < 2 or rect[3] - rect[1] < 2:
             return
         kind = self.kind.get()
-        if kind == "text":
+        if kind == "chat":  # one chat panel: replace the previous one; height = 3 lines
+            for z in self.zones:
+                if z.kind == "chat":
+                    remove_guarded(z.rect, self.path)
+            rect = self.clamp((rect[0], rect[1], max(rect[2], rect[0] + 40), rect[1] + CHAT_H - 1))
+            add_guarded(rect, "chat", self.path, "chat")
+        elif kind == "text":
             got = TextDialog(self.root, f"New text zone {rect}").result
             if not got:
                 return
