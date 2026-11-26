@@ -12,6 +12,7 @@ guarded.txt: one zone per line, board coordinates (inclusive); everything after 
     x0 y0 x1 y1 white note                              plain white
     x0 y0 x1 y1 text fg=ffffff ol=000000 bg=none TEXT   TEXT as big as fits in the box, centred;
                                                         "|" starts a new line
+    x0 y0 x1 y1 off ...                                 any zone, kept in the list but not painted
   fg = text colour, ol = outline colour or none, bg = background colour or none (letters only).
 Delete a line to stop guarding that zone. Where a zone lies on our own art (MERCI flag, heart)
 our colours are restored instead, so the guards never fight.
@@ -34,6 +35,10 @@ class Zone(NamedTuple):
     note: str         # the text of a text zone, a free note otherwise
     kind: str = "flag"
     opts: dict = {}
+    enabled: bool = True  # False: listed ("off") but not painted
+
+    def key(self):
+        return (self.rect, self.note, self.kind, tuple(sorted(self.opts.items())), self.enabled)
 
 
 def parse_line(line):
@@ -44,13 +49,16 @@ def parse_line(line):
         return None
     if x0 > x1 or y0 > y1:
         return None
-    rest, kind, opts = parts[4:], "flag", {}
+    rest, kind, opts, enabled = parts[4:], "flag", {}, True
+    if rest and rest[0].lower() == "off":
+        enabled = False
+        rest.pop(0)
     if rest and rest[0].lower() in KINDS:
         kind = rest.pop(0).lower()
     while rest and "=" in rest[0] and rest[0].split("=")[0].lower() in OPT_KEYS:
         k, v = rest.pop(0).split("=", 1)
         opts[k.lower()] = v.lower()
-    return Zone((x0, y0, x1, y1), " ".join(rest), kind, opts)
+    return Zone((x0, y0, x1, y1), " ".join(rest), kind, opts, enabled)
 
 
 def load_guarded(path=GUARDED):
@@ -106,6 +114,21 @@ def move_guarded(old, new, path=GUARDED):
                 body, sep, comment = line.partition("#")
                 line = " ".join([str(v) for v in new] + body.split()[4:]) + (f"  #{comment}" if sep else "\n")
                 done = True
+            out.append(line)
+        return out
+    _rewrite(path, change)
+
+
+def set_enabled(rect, enabled, path=GUARDED):
+    """Switch painting of the zone at `rect` on or off (an "off" word after its coordinates)."""
+    def change(lines):
+        out = []
+        for line in lines:
+            if _rect_of(line) == tuple(rect):
+                body, sep, comment = line.partition("#")
+                words = body.split()
+                rest = words[5:] if words[4:5] and words[4].lower() == "off" else words[4:]  # only the marker
+                line = " ".join(words[:4] + ([] if enabled else ["off"]) + rest) + (f"  #{comment}" if sep else "\n")
             out.append(line)
         return out
     _rewrite(path, change)
@@ -234,6 +257,8 @@ def main():
     def pixels():  # re-read every round: scan_hate.py and flag_ui.py may have changed the list
         want = {}
         for zone in load_guarded(args.file):
+            if not zone.enabled:
+                continue
             for x, y, c in zone_target(zone, ours):
                 want[(x, y)] = c
         return [(x, y, c) for (x, y), c in want.items()]
