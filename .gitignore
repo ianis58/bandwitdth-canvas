@@ -2,3 +2,4 @@ __pycache__/
 fastpow/*.so
 fastpow/*.dylib
 fastpow/*.dll
+cover_preview.png
