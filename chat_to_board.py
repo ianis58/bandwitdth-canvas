@@ -2,15 +2,20 @@
 """Show a YouTube live chat on the canvas: the latest messages, in a chat panel you place on the
 board. Needs paint_flag.py and hate_words.py in the same folder.
 
-    pip install chat-downloader pillow numpy requests better-profanity
+    pip install -U yt-dlp pillow numpy requests better-profanity
 
     python3 chat_to_board.py URL --rect 600 860 1010 1010 --dry-run   # preview, no painting
     python3 chat_to_board.py URL --rect 600 860 1010 1010             # paint and keep it updated
+    python3 chat_to_board.py URL --rect ... --cookies-from-browser firefox   # if YouTube asks to sign in
     python3 chat_to_board.py --demo --rect 600 860 1010 1010 --dry-run   # fake messages
 
 How it works:
-  - Messages are read with chat-downloader (no API key), or with the official YouTube Data API
-    if you pass --api-key (needs a Google Cloud key with the YouTube Data API v3 enabled).
+  - Messages are read with yt-dlp (default; keep it updated with pip install -U yt-dlp), which
+    follows the live chat as it happens. If YouTube answers "Sign in to confirm you're not a bot"
+    or shows its cookie-consent page, add --cookies-from-browser firefox (or chrome, ...) to use
+    your own browser's YouTube cookies, or --cookies FILE. Other readers: --reader
+    chat-downloader, or the official YouTube Data API with --api-key (a Google Cloud key with
+    the YouTube Data API v3 enabled).
   - Each message becomes one line "author: message" in small crisp text: author in French blue,
     message in black, on white. The panel is a ring of line slots: a new message replaces the
     oldest line and gets the ">" marker, so each message costs about one line of pixels (a
@@ -57,11 +62,64 @@ def clean(text):
 
 
 # chat sources: each puts (author, message) tuples into a queue
-def read_chat_downloader(url, out):
+def chat_items(obj):
+    """(author, message) of every chat message renderer found in a YouTube chat JSON object."""
+    if isinstance(obj, dict):
+        for key in ("liveChatTextMessageRenderer", "liveChatPaidMessageRenderer"):
+            r = obj.get(key)
+            if isinstance(r, dict):
+                runs = r.get("message", {}).get("runs", [])
+                text = "".join(run.get("text") or (run.get("emoji", {}).get("shortcuts") or [""])[0] for run in runs)
+                yield r.get("authorName", {}).get("simpleText", ""), text
+        for v in obj.values():
+            yield from chat_items(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from chat_items(v)
+
+
+def read_ytdlp(url, out, cookie_args):
+    """Run yt-dlp on the live chat and follow the JSON lines it writes as messages arrive."""
+    import json, shutil, sys, tempfile
+    while True:
+        tmp = tempfile.mkdtemp(prefix="chat_")
+        cmd = [sys.executable, "-m", "yt_dlp", "--skip-download", "--write-subs", "--sub-langs", "live_chat",
+               "--no-warnings", *cookie_args, "-o", os.path.join(tmp, "chat"), url]
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        pos, path = 0, None
+        while True:
+            alive = proc.poll() is None
+            for name in ("chat.live_chat.json.part", "chat.live_chat.json"):
+                if os.path.exists(os.path.join(tmp, name)):
+                    if path != name:
+                        path, pos = name, (pos if path else 0)
+                    break
+            if path and os.path.exists(os.path.join(tmp, path)):
+                with open(os.path.join(tmp, path), encoding="utf-8", errors="replace") as f:
+                    f.seek(pos)
+                    data = f.read()
+                end = data.rfind("\n") + 1  # complete lines only
+                pos += len(data[:end].encode("utf-8"))
+                for line in data[:end].splitlines():
+                    try:
+                        for item in chat_items(json.loads(line)):
+                            out.put(item)
+                    except ValueError:
+                        pass
+            if not alive:
+                break
+            time.sleep(1)
+        err = (proc.stderr.read() or "").strip().splitlines()
+        print(f"chat reader (yt-dlp) stopped: {err[-1] if err else 'stream ended?'} (retrying in 15 s)", flush=True)
+        shutil.rmtree(tmp, ignore_errors=True)
+        time.sleep(15)
+
+
+def read_chat_downloader(url, out, cookies=None):
     from chat_downloader import ChatDownloader
     while True:
         try:
-            for m in ChatDownloader().get_chat(url):
+            for m in ChatDownloader(cookies=cookies).get_chat(url):
                 out.put((m.get("author", {}).get("name", ""), m.get("message", "")))
         except Exception as e:
             print(f"chat reader: {type(e).__name__}: {e} (retrying in 15 s)", flush=True)
@@ -150,10 +208,16 @@ def main():
     ap.add_argument("--rect", type=int, nargs=4, required=True, metavar=("X0", "Y0", "X1", "Y1"),
                     help="chat panel on the board (inclusive); flag_ui.py helps to find a free area")
     ap.add_argument("--font-size", type=int, default=10)
-    ap.add_argument("--api-key", help="use the official YouTube Data API instead of chat-downloader")
+    ap.add_argument("--reader", choices=["yt-dlp", "chat-downloader", "api"], default="yt-dlp",
+                    help="how to read the chat (api needs --api-key)")
+    ap.add_argument("--cookies-from-browser", metavar="BROWSER",
+                    help="yt-dlp: use this browser's YouTube cookies (firefox, chrome, ...)")
+    ap.add_argument("--cookies", metavar="FILE", help="cookies.txt file for yt-dlp / chat-downloader")
+    ap.add_argument("--api-key", help="key for the official YouTube Data API (with --reader api)")
     ap.add_argument("--demo", action="store_true", help="fake messages instead of the live chat")
     ap.add_argument("--dry-run", action="store_true", help="no painting: save chat_preview.png after a few messages")
     ap.add_argument("--interval", type=float, default=3, help="seconds between panel updates")
+    ap.add_argument("--preview-after", type=float, default=40, help="--dry-run: seconds of chat to collect")
     ap.add_argument("--workers", type=int, default=min(128, 8 * (os.cpu_count() or 4)))
     ap.add_argument("--max-bits", type=int, default=11)
     ap.add_argument("--name", default=os.environ.get("NAME", "tricolore"))
@@ -163,12 +227,18 @@ def main():
     print(f"chat panel {panel.w}x{panel.h} at ({x0},{y0}): {panel.rows} lines", flush=True)
 
     msgs = queue.Queue()
+    cookie_args = (["--cookies-from-browser", args.cookies_from_browser] if args.cookies_from_browser else []) + \
+                  (["--cookies", args.cookies] if args.cookies else [])
     if args.demo:
         reader = threading.Thread(target=read_demo, args=(msgs,), daemon=True)
-    elif args.api_key:
+    elif args.reader == "api" or args.api_key:
+        if not args.api_key:
+            raise SystemExit("--reader api needs --api-key")
         reader = threading.Thread(target=read_youtube_api, args=(args.url, args.api_key, msgs), daemon=True)
+    elif args.reader == "chat-downloader":
+        reader = threading.Thread(target=read_chat_downloader, args=(args.url, msgs, args.cookies), daemon=True)
     else:
-        reader = threading.Thread(target=read_chat_downloader, args=(args.url, msgs), daemon=True)
+        reader = threading.Thread(target=read_ytdlp, args=(args.url, msgs, cookie_args), daemon=True)
     reader.start()
 
     if not args.dry_run:
@@ -200,7 +270,7 @@ def main():
             ys, xs = np.nonzero((area != target).any(axis=2))
             todo = [(int(x0 + x), int(y0 + y), target[y, x].tobytes().hex()) for y, x in zip(ys, xs)]
             if args.dry_run:
-                if time.time() - started > 6 or not reader.is_alive():
+                if time.time() - started > args.preview_after or not reader.is_alive():
                     prev = board.copy()
                     prev[y0:y1 + 1, x0:x1 + 1] = target
                     Image.fromarray(prev[max(0, y0 - 20):y1 + 21, max(0, x0 - 20):x1 + 21]).resize(
