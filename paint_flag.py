@@ -38,9 +38,10 @@ _name = "tricolore"
 
 # Pixels left to the neighbouring fox art, whose sparkle reaches into the flag's bottom-left
 # corner: the sparkle plus a 1 px margin. '#' = theirs, '.' = flag. The top-left character
-# sits at FOX_AT, relative to the flag's top-left corner (board x 877, y 571 by default).
-FOX_AT = (0, 80)
+# sits at FOX_AT, relative to the flag's top-left corner (board x 877, y 570 by default).
+FOX_AT = (0, 79)
 FOX_MASK = [
+    "#........",
     "##.......",
     "###......",
     "########.",
