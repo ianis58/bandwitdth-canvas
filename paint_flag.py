@@ -26,7 +26,7 @@ the heat window (120 s) adds a bit to its price for *everyone*, us included. Rep
 pixels nobody touched doubles our own cost for nothing, and hot pixels cool by one bit per
 window when left alone, so pricey fights are cheaper to win a little later.
 """
-import argparse, ctypes, gzip, os, random, struct, sys, threading, time
+import argparse, ctypes, gzip, json, os, random, struct, sys, threading, time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
@@ -128,7 +128,21 @@ def flag_pixels(ox, oy, width, skip=FOX_PIXELS):
             yield ox + x, oy + y, COLORS[min(2, int(x // band))]
 
 
-CORES = os.cpu_count() or 4
+def _hash_threads():
+    """How many threads may hash at once: HASH_THREADS env var, else fastpow/tuning.json (measured
+    by fastpow/build.py: on Hyper-Threading CPUs one hash per physical core can be faster, since
+    two hashes on one core fight over its cache), else every CPU thread."""
+    if os.environ.get("HASH_THREADS"):
+        return max(1, int(os.environ["HASH_THREADS"]))
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "fastpow", "tuning.json")) as f:
+            return max(1, int(json.load(f)["hash_threads"]))
+    except (OSError, ValueError, KeyError):
+        return os.cpu_count() or 4
+
+
+CORES = _hash_threads()
+_hash_slots = threading.BoundedSemaphore(CORES)  # workers wait on the network; at most CORES hash
 _helpers = None
 
 
@@ -146,6 +160,10 @@ def solve_split(prefix, epoch, bits, nonce, ways):
 
     def helper(i):
         found, start = ctypes.c_uint64(), nonce + i
+        with _hash_slots:
+            return search(found, start)
+
+    def search(found, start):
         while not stop.value:
             r = _fast.canvas_search_stop(prefix, epoch, bits, start, ways, 1 << 14, ctypes.byref(found),
                                          ctypes.byref(stop))
@@ -169,20 +187,21 @@ def solve(epoch, x, y, rgb, bits):
     ways = min(CORES, 1 << max(0, bits - 8))
     if _fast and _kib == 1024 and ways > 1 and hasattr(_fast, "canvas_search_stop"):
         return solve_split(prefix, epoch, bits, nonce, ways)
-    if _fast and _kib == 1024:  # whole search loop in C, 65536 nonces per call
-        found = ctypes.c_uint64()
+    with _hash_slots:
+        if _fast and _kib == 1024:  # whole search loop in C, 65536 nonces per call
+            found = ctypes.c_uint64()
+            while True:
+                r = _fast.canvas_search(prefix, epoch, bits, nonce, 1 << 16, ctypes.byref(found))
+                if r == 1:
+                    return found.value
+                if r < 0:
+                    raise MemoryError("fastpow: could not allocate work memory")
+                nonce += 1 << 16
+        limit = 1 << (256 - bits)
         while True:
-            r = _fast.canvas_search(prefix, epoch, bits, nonce, 1 << 16, ctypes.byref(found))
-            if r == 1:
-                return found.value
-            if r < 0:
-                raise MemoryError("fastpow: could not allocate work memory")
-            nonce += 1 << 16
-    limit = 1 << (256 - bits)
-    while True:
-        if int.from_bytes(argon2id(prefix + struct.pack("<Q", nonce), epoch), "big") < limit:
-            return nonce
-        nonce += 1
+            if int.from_bytes(argon2id(prefix + struct.pack("<Q", nonce), epoch), "big") < limit:
+                return nonce
+            nonce += 1
 
 
 def bench(seconds=2.0):
@@ -361,7 +380,8 @@ def run(pixels, args, what):
     pixels = current()
     if spec != "0/1":
         what += f", shard {spec} ({len(pixels)} px)"
-    print(f"{what}, name {args.name!r}, {args.workers} workers, hashing with {backend()}", flush=True)
+    print(f"{what}, name {args.name!r}, {args.workers} workers, hashing with {backend()} on {CORES} threads",
+          flush=True)
 
     # Threads, not processes: a worker mostly waits on the network, and the hashing (C library,
     # libsodium or libargon2) runs outside Python's GIL, so threads still use every core.
