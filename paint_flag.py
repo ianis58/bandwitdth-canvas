@@ -13,7 +13,9 @@ Options: --x 877 --y 491 --width 147   position/size (height = width * 2/3)
          --no-fox                      also paint the fox's sparkle area (see FOX_MASK)
          --workers N                   paints in flight, as threads (default: 16 per CPU, max 256)
          --max-bits 12                 leave pixels pricier than this for a later round
-         --interval 30                 seconds between guard rounds
+         --interval 30                 seconds between guard rounds (when nothing is left to do)
+         --batch 3000                  guard: at most this many pixels per round, worst first
+         --shard K/N                   guard only share K of N, to split work between machines
          --name tricolore              leaderboard name (or NAME env var)
 
 The flag is 3:2 (width:height), split into three equal vertical bands:
@@ -235,8 +237,26 @@ def damaged(pixels):
             if board[(y * w + x) * 3:(y * w + x) * 3 + 3] != bytes.fromhex(c)]
 
 
+def prioritize(tasks):
+    """Densely damaged areas (a pasted picture or text) before isolated noise dots, top to bottom
+    within each density band, so a pasted message is usually wiped from its first line down."""
+    bad = {(x, y) for x, y, _ in tasks}
+    near = [(dx, dy) for dx in range(-2, 3) for dy in range(-2, 3)]
+
+    def key(t):
+        x, y = t[0], t[1]
+        return -(sum((x + dx, y + dy) in bad for dx, dy in near) // 6), y, x
+    return sorted(tasks, key=key)
+
+
+def shard(pixels, spec):
+    """Keep this machine's share 'K/N' of the pixels: 16x16 tiles in a checkerboard-like pattern,
+    so N machines can guard the same art without painting the same pixels."""
+    k, n = (int(v) for v in spec.split("/"))
+    return [p for p in pixels if ((p[0] // 16) + (p[1] // 16)) % n == k]
+
+
 def run_pass(pool, tasks, label):
-    random.shuffle(tasks)
     total, counts, t0 = len(tasks), {}, time.time()
     print(f"{label}: {total} pixels to paint", flush=True)
     futures = [pool.submit(paint_one, t) for t in tasks]
@@ -263,6 +283,9 @@ def add_common_args(ap, x, y):
     ap.add_argument("--fix", action="store_true", help="only repaint pixels that differ on the board")
     ap.add_argument("--guard", action="store_true", help="repair damaged pixels in a loop until Ctrl-C")
     ap.add_argument("--interval", type=float, default=30)
+    ap.add_argument("--batch", type=int, default=3000,
+                    help="guard: repair at most this many pixels per round, worst damage first, then rescan")
+    ap.add_argument("--shard", default="0/1", help="K/N: guard only share K of N (several machines, no overlap)")
 
 
 def main():
@@ -284,6 +307,9 @@ def run(pixels, args, what):
     if cfg.get("read_only"):
         sys.exit("board is read-only")
     _init(cfg["pow_kib"], args.max_bits, args.name)
+    if getattr(args, "shard", "0/1") != "0/1":
+        pixels = shard(pixels, args.shard)
+        what += f", shard {args.shard} ({len(pixels)} px)"
     print(f"{what}, name {args.name!r}, {args.workers} workers, hashing with {backend()}", flush=True)
 
     # Threads, not processes: a worker mostly waits on the network, and the hashing (C library,
@@ -291,7 +317,7 @@ def run(pixels, args, what):
     with ThreadPoolExecutor(args.workers) as pool:
         try:
             if not args.guard:
-                tasks = damaged(pixels) if args.fix else list(pixels)
+                tasks = prioritize(damaged(pixels)) if args.fix else list(pixels)
                 print("done", run_pass(pool, tasks, "fix" if args.fix else "paint"), flush=True)
                 return
             rnd = 0
@@ -308,12 +334,16 @@ def run(pixels, args, what):
                     continue
                 intact = 100 * (len(pixels) - len(tasks)) / len(pixels)
                 stamp = time.strftime("%H:%M:%S")
+                batch = getattr(args, "batch", 0)
+                more = bool(batch) and len(tasks) > batch
                 if tasks:
+                    tasks = prioritize(tasks)[:batch] if more else prioritize(tasks)
                     counts = run_pass(pool, tasks, f"[{stamp}] round {rnd}, {intact:.1f}% intact")
                     print(f"  repaired {counts.get('ok', 0)}, deferred {counts.get('deferred', 0)}", flush=True)
                 else:
                     print(f"[{stamp}] round {rnd}: flag 100% intact", flush=True)
-                time.sleep(args.interval)
+                if not more:  # a full batch means more damage is waiting: rescan right away
+                    time.sleep(args.interval)
         except KeyboardInterrupt:
             pool.shutdown(wait=False, cancel_futures=True)
             print("\nstopped", flush=True)
