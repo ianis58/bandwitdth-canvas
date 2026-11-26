@@ -10,11 +10,13 @@ the canvas. Same options as paint_flag.py, which must sit in the same folder.
 
 Default: x 3, y 57, 506x337 - between the board's left edge, the rainbow bar and the art on the
 right. The croissant is drawn for any --width. Previous place: --x 877 --y 672 --width 147.
---no-croissant paints the plain flag.
+--no-croissant paints the plain flag. rix's "VIVE LA FRANCE" banner (vive_banner.py, board
+coordinates x 127-407, y 74-109) is painted over the flag; --no-banner leaves it out.
 """
 import argparse, math
 
 from paint_flag import add_common_args, flag_pixels, run
+from vive_banner import banner_pixels
 
 # 1 outline, 2 shadow, 3 base, 4 light, 5 highlight
 CROISSANT_COLORS = {1: "4a2a0e", 2: "9c5518", 3: "cf8429", 4: "eaae4c", 5: "fbe0a0"}
@@ -136,11 +138,13 @@ EXIL_MASK = [
 GIVEN_AWAY = mask((877, 675), FOX_MASK) | mask((944, 762), EXIL_MASK)
 
 
-def croissant_flag_pixels(ox, oy, width, skip=GIVEN_AWAY, croissant=True):
+def croissant_flag_pixels(ox, oy, width, skip=GIVEN_AWAY, croissant=True, banner=True):
+    """The flag, the croissant over it, and rix's "VIVE LA FRANCE" banner over both."""
     art = croissant_pixels(width) if croissant else {}
+    ban = banner_pixels() if banner else {}
     for x, y, color in flag_pixels(ox, oy, width, set()):
         if (x, y) not in skip:
-            yield x, y, art.get((x - ox, y - oy), color)
+            yield x, y, ban.get((x, y)) or art.get((x - ox, y - oy), color)
 
 
 def main():
@@ -148,9 +152,11 @@ def main():
     add_common_args(ap, x=3, y=57)
     ap.set_defaults(width=506)
     ap.add_argument("--no-croissant", action="store_true", help="paint the plain flag")
+    ap.add_argument("--no-banner", action="store_true", help="leave out rix's VIVE LA FRANCE banner")
     args = ap.parse_args()
     skip = set() if args.no_fox else GIVEN_AWAY
-    pixels = list(croissant_flag_pixels(args.x, args.y, args.width, skip, not args.no_croissant))
+    pixels = list(croissant_flag_pixels(args.x, args.y, args.width, skip, not args.no_croissant,
+                                        not args.no_banner))
     run(pixels, args, f"croissant flag {args.width}x{round(args.width * 2 / 3)} at ({args.x},{args.y}), "
                       f"{len(pixels)} px")
 
