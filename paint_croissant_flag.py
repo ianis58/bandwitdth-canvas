@@ -145,6 +145,20 @@ FOX_MASK = [
     "##...............",
 ]
 
+# Left to Exil_S, who paints a red heart straddling the flag's bottom edge (white band), with a
+# 1 px margin. '#' = theirs. Top-left character sits at EXIL_AT, relative to the flag.
+EXIL_AT = (67, 90)
+EXIL_MASK = [
+    "...####..####...",
+    "...####..####...",
+    ".##############.",
+    "################",
+    "################",
+    "################",
+    "################",
+    "################",
+]
+
 
 def art(at, rows, keep=lambda ch: ch != "."):
     return {(at[0] + dx, at[1] + dy): ch
@@ -152,10 +166,12 @@ def art(at, rows, keep=lambda ch: ch != "."):
 
 
 FOX_PIXELS = set(art(FOX_AT, FOX_MASK, lambda ch: ch == "#"))
+EXIL_PIXELS = set(art(EXIL_AT, EXIL_MASK, lambda ch: ch == "#"))
+GIVEN_AWAY = FOX_PIXELS | EXIL_PIXELS
 CROISSANT_PIXELS = art(CROISSANT_AT, CROISSANT)
 
 
-def croissant_flag_pixels(ox, oy, width, skip=FOX_PIXELS, croissant=True):
+def croissant_flag_pixels(ox, oy, width, skip=GIVEN_AWAY, croissant=True):
     for x, y, color in flag_pixels(ox, oy, width, skip):
         ch = CROISSANT_PIXELS.get((x - ox, y - oy)) if croissant else None
         yield x, y, CROISSANT_COLORS[ch] if ch else color
@@ -166,10 +182,10 @@ def main():
     add_common_args(ap, x=877, y=672)
     ap.add_argument("--no-croissant", action="store_true", help="paint the plain flag")
     args = ap.parse_args()
-    skip = set() if args.no_fox else FOX_PIXELS
+    skip = set() if args.no_fox else GIVEN_AWAY
     pixels = list(croissant_flag_pixels(args.x, args.y, args.width, skip, not args.no_croissant))
     run(pixels, args, f"croissant flag {args.width}x{round(args.width * 2 / 3)} at ({args.x},{args.y}) "
-                      f"minus {len(skip)} px left to the fox")
+                      f"minus {len(skip)} px left to the fox and Exil_S's heart")
 
 
 if __name__ == "__main__":

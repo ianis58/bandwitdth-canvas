@@ -152,7 +152,8 @@ def add_common_args(ap, x, y):
     ap.add_argument("--x", type=int, default=x)
     ap.add_argument("--y", type=int, default=y)
     ap.add_argument("--width", type=int, default=147)
-    ap.add_argument("--no-fox", action="store_true", help="also paint over the fox's area")
+    ap.add_argument("--no-fox", action="store_true",
+                    help="also paint over the areas left to neighbours (fox art, Exil_S's heart)")
     ap.add_argument("--workers", type=int, default=min(48, 6 * (os.cpu_count() or 4)))
     ap.add_argument("--max-bits", type=int, default=12)
     ap.add_argument("--name", default=os.environ.get("NAME", "tricolore"))
