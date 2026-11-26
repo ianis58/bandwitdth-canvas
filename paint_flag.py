@@ -8,6 +8,7 @@
     python3 paint_flag.py --guard         # keep repairing damaged pixels until Ctrl-C
 
 Options: --x 877 --y 491 --width 147   position/size (height = width * 2/3)
+         --fox-w 10 --fox-h 24         bottom-left corner left unpainted for the fox art
          --workers N                   parallel workers (default: 6 per CPU, max 48)
          --max-bits 12                 leave pixels pricier than this for a later round
          --interval 30                 seconds between guard rounds
@@ -35,11 +36,15 @@ _max_bits = 12
 _name = "tricolore"
 
 
-def flag_pixels(ox, oy, width):
+def flag_pixels(ox, oy, width, fox_w=10, fox_h=24):
+    """Flag pixels, minus a fox_w x fox_h rectangle in the bottom-left corner left to the
+    neighbouring fox art (its sparkle reaches into the flag there)."""
     height = round(width * 2 / 3)
     band = width / 3
     for y in range(height):
         for x in range(width):
+            if x < fox_w and y >= height - fox_h:
+                continue
             yield ox + x, oy + y, COLORS[min(2, int(x // band))]
 
 
@@ -125,6 +130,8 @@ def main():
     ap.add_argument("--x", type=int, default=877)
     ap.add_argument("--y", type=int, default=491)
     ap.add_argument("--width", type=int, default=147)
+    ap.add_argument("--fox-w", type=int, default=10, help="width of the bottom-left corner left to the fox")
+    ap.add_argument("--fox-h", type=int, default=24, help="height of the bottom-left corner left to the fox")
     ap.add_argument("--workers", type=int, default=min(48, 6 * (os.cpu_count() or 4)))
     ap.add_argument("--max-bits", type=int, default=12)
     ap.add_argument("--name", default=os.environ.get("NAME", "tricolore"))
@@ -136,8 +143,9 @@ def main():
     cfg = requests.get(f"{BASE}/api/config", timeout=20).json()
     if cfg.get("read_only"):
         sys.exit("board is read-only")
-    pixels = list(flag_pixels(args.x, args.y, args.width))
-    print(f"flag {args.width}x{len(pixels) // args.width} at ({args.x},{args.y}), "
+    pixels = list(flag_pixels(args.x, args.y, args.width, args.fox_w, args.fox_h))
+    print(f"flag {args.width}x{round(args.width * 2 / 3)} at ({args.x},{args.y}) "
+          f"minus {args.fox_w}x{args.fox_h} fox corner, "
           f"name {args.name!r}, {args.workers} workers", flush=True)
 
     with mp.Pool(args.workers, initializer=_init,
