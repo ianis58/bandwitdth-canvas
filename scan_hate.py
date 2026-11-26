@@ -210,7 +210,7 @@ def main():
             time.sleep(args.interval)
             continue
         board = np.frombuffer(raw, dtype=np.uint8).reshape(-1, w, 3)
-        known = [r for r, *_ in load_guarded(args.file)]
+        known = [z.rect for z in load_guarded(args.file)]
         new = []
         for word, rect in find_words(board, args.min_conf):
             if not any(overlap(rect, r) for r in known + [n for n, _ in new]):
