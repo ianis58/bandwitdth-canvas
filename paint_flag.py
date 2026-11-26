@@ -57,6 +57,13 @@ def _load_fast():
         lib.canvas_search.restype = ctypes.c_int
         lib.canvas_search.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_uint64,
                                       ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint64)]
+        try:  # libraries built before this function existed simply solve on one thread
+            lib.canvas_search_stop.restype = ctypes.c_int
+            lib.canvas_search_stop.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_uint64,
+                                               ctypes.c_uint64, ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint64),
+                                               ctypes.POINTER(ctypes.c_int)]
+        except AttributeError:
+            pass
         lib.canvas_init()
         return lib
     return None
@@ -121,9 +128,47 @@ def flag_pixels(ox, oy, width, skip=FOX_PIXELS):
             yield ox + x, oy + y, COLORS[min(2, int(x // band))]
 
 
+CORES = os.cpu_count() or 4
+_helpers = None
+
+
+def _helper_pool():
+    global _helpers
+    if _helpers is None:
+        _helpers = ThreadPoolExecutor(CORES, thread_name_prefix="solve")
+    return _helpers
+
+
+def solve_split(prefix, epoch, bits, nonce, ways):
+    """One pixel's search shared by `ways` threads (interleaved nonces); all of them stop within
+    one hash when any finds a solution, so splitting wastes (almost) nothing."""
+    stop, result = ctypes.c_int(0), []
+
+    def helper(i):
+        found, start = ctypes.c_uint64(), nonce + i
+        while not stop.value:
+            r = _fast.canvas_search_stop(prefix, epoch, bits, start, ways, 1 << 14, ctypes.byref(found),
+                                         ctypes.byref(stop))
+            if r == 1:
+                result.append(found.value)
+                return
+            if r < 0:
+                raise MemoryError("fastpow: could not allocate work memory")
+            start += ways << 14
+
+    for f in [_helper_pool().submit(helper, i) for i in range(ways)]:
+        f.result()
+    return result[0]
+
+
 def solve(epoch, x, y, rgb, bits):
     prefix = struct.pack("<HH", x, y) + rgb
     nonce = random.getrandbits(62)  # random start: a repeat paint must not find a used solution
+    # pricey pixels are shared by several cores: 1 thread at 8 bits, 2 at 9, 4 at 10 ... all cores
+    # from 12 bits; the overshoot (at most one hash per thread) stays under 1/256 of the work
+    ways = min(CORES, 1 << max(0, bits - 8))
+    if _fast and _kib == 1024 and ways > 1 and hasattr(_fast, "canvas_search_stop"):
+        return solve_split(prefix, epoch, bits, nonce, ways)
     if _fast and _kib == 1024:  # whole search loop in C, 65536 nonces per call
         found = ctypes.c_uint64()
         while True:

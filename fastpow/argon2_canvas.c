@@ -186,6 +186,31 @@ static inline int zero_bits_ok(const uint8_t *h, int bits) {
     return bits == 0 || (h[i] >> (8 - bits)) == 0;
 }
 
+/* Like canvas_search, but for several threads sharing one pixel: tries start, start+step,
+ * start+2*step, ... (count of them), and returns early as soon as *stop becomes non-zero; on
+ * success it sets *stop = 1 itself, so the other threads stop within one hash. */
+int canvas_search_stop(const uint8_t prefix[7], const uint8_t salt[16], int bits, uint64_t start,
+                       uint64_t step, uint64_t count, uint64_t *found, volatile int *stop) {
+    canvas_init();
+    static __thread void *mem = NULL;
+    if (!mem) mem = canvas_alloc();
+    if (!mem) return -1;
+    uint8_t pwd[15], out[32];
+    memcpy(pwd, prefix, 7);
+    uint64_t n = start;
+    for (uint64_t i = 0; i < count; i++, n += step) {
+        if (stop && *stop) return 0;
+        for (int k = 0; k < 8; k++) pwd[7 + k] = (uint8_t)(n >> (8 * k));
+        canvas_hash(pwd, 15, salt, out, mem);
+        if (zero_bits_ok(out, bits)) {
+            *found = n;
+            if (stop) *stop = 1;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* Try nonces start .. start+count-1 for password prefix (x u16le, y u16le, r, g, b).
  * Returns 1 and sets *found on success, 0 if none of them works. Thread-safe. */
 int canvas_search(const uint8_t prefix[7], const uint8_t salt[16], int bits,
