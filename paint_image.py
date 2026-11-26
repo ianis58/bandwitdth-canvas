@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Paint a picture on the canvas, scaled to fill a rectangle, and optionally keep it alive.
-Default: art/duo.png (the two guys with sunglasses) in place of the second French flag, on the
-right of the board, (743,256)-(994,396). Needs paint_flag.py in the same folder.
+Default: art/duo.png (Justice, the two guys with sunglasses) in place of the second French flag,
+on the right of the board, (743,256)-(994,396), with a QR code to their Spotify page in its
+bottom-right corner (art/duo_qr.txt). Needs paint_flag.py in the same folder.
 
     pip install argon2-cffi requests pillow numpy
 
@@ -16,6 +17,13 @@ right of the board, (743,256)-(994,396). Needs paint_flag.py in the same folder.
 --fit contain        whole picture inside the rectangle; the uncovered strips are left alone
 --fit stretch        squash the picture to the rectangle exactly
 --no-sharpen         keep the plain downscale (sharpening keeps hair and glasses crisp)
+--qr FILE_OR_TEXT    QR code in a corner: a .txt module grid (X = dark, . = light) or a text/URL
+                     to encode (that needs pip install segno); default art/duo_qr.txt with the
+                     default picture, none with another one
+--no-qr              no QR code
+--qr-scale 2         board pixels per QR module (1 is tiny, hard to scan from the stream)
+--qr-margin 2        white modules around the code (scanners need a light border)
+--qr-corner br       br, bl, tr or tl corner of the rectangle
 --zones-off          switch off the guarded.txt zones under the picture, so guard_flags.py
                      does not paint them back over it
 Transparent pixels (alpha < 128) are not painted. Already-right pixels are always skipped.
@@ -31,6 +39,7 @@ from paint_flag import fetch_board, run
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_IMAGE = os.path.join(HERE, "art", "duo.png")
 DEFAULT_RECT = (743, 256, 994, 396)  # where the second French flag was, right of the board
+DEFAULT_QR = os.path.join(HERE, "art", "duo_qr.txt")  # https://tinyurl.com/bdz9xmc9 (Justice, Spotify)
 
 
 def fitted(path, w, h, fit="cover", sharpen=True):
@@ -66,6 +75,52 @@ def image_pixels(path, rect, fit="cover", sharpen=True):
     ph, pw = alpha.shape
     return [(x0 + ox + i, y0 + oy + j, "%02x%02x%02x" % tuple(rgb[j, i]))
             for j in range(ph) for i in range(pw) if alpha[j, i] >= 128]
+
+
+def qr_matrix(spec):
+    """[[bool]] dark modules of a QR code: from a .txt grid file, or encoding the text `spec`."""
+    if os.path.isfile(spec):
+        with open(spec) as f:
+            rows = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+        return [[ch in "X#1" for ch in row] for row in rows]
+    try:
+        import segno
+    except ImportError:
+        raise SystemExit(f"--qr {spec!r}: not a file, and encoding text needs: pip install segno")
+    return [[bool(v) for v in row] for row in segno.make_qr(spec, error="q", boost_error=True).matrix_iter(border=0)]
+
+
+def qr_pixels(matrix, rect, corner="br", scale=2, margin=2):
+    """[(x, y, colour)] of the QR code (black on white, with a white border of `margin` modules),
+    `scale` pixels per module, in `corner` of rect."""
+    n = len(matrix)
+    size = (n + 2 * margin) * scale
+    x0, y0, x1, y1 = rect
+    if size > min(x1 - x0 + 1, y1 - y0 + 1):
+        raise SystemExit(f"QR code ({size}x{size} px) does not fit in the rectangle: lower --qr-scale/--qr-margin")
+    left = x1 - size + 1 if corner[1] == "r" else x0
+    top = y1 - size + 1 if corner[0] == "b" else y0
+    out = []
+    for j in range(size):
+        for i in range(size):
+            mj, mi = j // scale - margin, i // scale - margin
+            dark = 0 <= mj < n and 0 <= mi < n and matrix[mj][mi]
+            out.append((left + i, top + j, "000000" if dark else "ffffff"))
+    return out
+
+
+def qr_check(pixels, rect):
+    """What a phone would read from the QR code as painted (needs opencv), or None."""
+    try:
+        import cv2
+    except ImportError:
+        return None
+    x0, y0, x1, y1 = rect
+    img = np.full((y1 - y0 + 41, x1 - x0 + 41), 255, np.uint8)
+    for x, y, c in pixels:
+        img[y - y0 + 20, x - x0 + 20] = int(c[:2], 16) * 0.299 + int(c[2:4], 16) * 0.587 + int(c[4:], 16) * 0.114
+    big = cv2.resize(img, None, fx=4, fy=4, interpolation=cv2.INTER_NEAREST)
+    return cv2.QRCodeDetector().detectAndDecode(big)[0] or "nothing (not readable)"
 
 
 def save_preview(pixels, rect, out):
@@ -105,6 +160,12 @@ def main():
     ap.add_argument("--rect", type=int, nargs=4, metavar=("X0", "Y0", "X1", "Y1"), default=DEFAULT_RECT)
     ap.add_argument("--fit", choices=("cover", "contain", "stretch"), default="cover")
     ap.add_argument("--no-sharpen", action="store_true")
+    ap.add_argument("--qr", help="QR code: .txt module grid or text/URL to encode (default art/duo_qr.txt "
+                                 "with the default picture)")
+    ap.add_argument("--no-qr", action="store_true")
+    ap.add_argument("--qr-scale", type=int, default=2, help="board pixels per QR module")
+    ap.add_argument("--qr-margin", type=int, default=2, help="white modules around the QR code")
+    ap.add_argument("--qr-corner", choices=("br", "bl", "tr", "tl"), default="br")
     ap.add_argument("--dry-run", action="store_true", help="save image_preview.png and exit, paint nothing")
     ap.add_argument("--zones-off", action="store_true", help="switch off guarded.txt zones under the picture")
     ap.add_argument("--guard", action="store_true", help="keep repairing the picture until Ctrl-C")
@@ -121,11 +182,20 @@ def main():
     if not (rect[0] <= rect[2] and rect[1] <= rect[3]) or min(rect) < 0:
         ap.error("--rect needs X0 <= X1 and Y0 <= Y1, all >= 0")
     pixels = image_pixels(args.image, rect, args.fit, not args.no_sharpen)
-    what = (f"{os.path.basename(args.image)} ({args.fit}) in ({rect[0]},{rect[1]})-({rect[2]},{rect[3]}), "
-            f"{len(pixels)} px")
+    what = f"{os.path.basename(args.image)} ({args.fit}) in ({rect[0]},{rect[1]})-({rect[2]},{rect[3]})"
+    qr = None if args.no_qr else args.qr or (DEFAULT_QR if os.path.abspath(args.image) == DEFAULT_IMAGE else None)
+    if qr:
+        code = qr_pixels(qr_matrix(qr), rect, args.qr_corner, args.qr_scale, args.qr_margin)
+        merged = {(x, y): c for x, y, c in pixels}
+        merged.update({(x, y): c for x, y, c in code})
+        pixels = [(x, y, c) for (x, y), c in merged.items()]
+        what += f" + QR code {code[-1][0] - code[0][0] + 1} px in the {args.qr_corner} corner"
+    what += f", {len(pixels)} px"
     if args.dry_run:
         out = save_preview(pixels, rect, os.path.join(HERE, "image_preview.png"))
         print(f"{what}; preview saved to {out}")
+        if qr:
+            print(f"QR code as painted reads: {qr_check(pixels, rect)}")
         return
     check_zones(rect, args.zones_off)
     run(pixels, args, what)
