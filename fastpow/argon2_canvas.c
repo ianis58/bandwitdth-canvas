@@ -7,7 +7,7 @@
  * (SSE2/AVX2/AVX-512, fill_block_opt.inc) and ref.c (portable, fill_block_ref.inc).
  * What is removed versus argon2id_hash_raw():
  *   - argument validation, encoding, threads, lanes, multiple passes, XOR mode (pass 0 only)
- *   - the 1 MiB allocation per hash, and secure wipes (of that memory and of BLAKE2b state)
+ *   - the 1 MiB allocation per hash (one buffer per thread is reused), and secure wipes
  *   - address-block generation: with t=1 the reference indices of the data-independent half
  *     (blocks 2..511) never change, so they are computed once in canvas_init()
  * canvas_search() runs the whole nonce loop in C, including the leading-zero-bits test.
@@ -159,8 +159,15 @@ void canvas_hash(const uint8_t *pwd, uint32_t pwdlen, const uint8_t salt[16], ui
 #if SIMD
     vec_t state[NVEC];
     memcpy(state, mem[1].v, ARGON2_BLOCK_SIZE);
-    for (uint32_t c = 2; c < 2 * SEGLEN; c++)
+    for (uint32_t c = 2; c < 2 * SEGLEN; c++) {
+#ifdef CANVAS_PREFETCH
+        /* the next reference block is known in advance here: start loading it now (helps CPUs
+           whose L2 cache is too small for the 1 MiB of work memory; build.py measures it) */
+        const char *nxt = (const char *)&mem[REF[c + 1 < 2 * SEGLEN ? c + 1 : c]];
+        for (int l = 0; l < ARGON2_BLOCK_SIZE; l += 64) _mm_prefetch(nxt + l, _MM_HINT_T0);
+#endif
         fill_block(state, &mem[REF[c]], &mem[c], 0);
+    }
     for (uint32_t c = 2 * SEGLEN; c < MBLOCKS; c++)
         fill_block(state, &mem[ref_index(c, (uint32_t)mem[c - 1].v[0])], &mem[c], 0);
 #else
@@ -184,7 +191,8 @@ static inline int zero_bits_ok(const uint8_t *h, int bits) {
 int canvas_search(const uint8_t prefix[7], const uint8_t salt[16], int bits,
                   uint64_t start, uint64_t count, uint64_t *found) {
     canvas_init();
-    void *mem = canvas_alloc();
+    static __thread void *mem = NULL;   /* one work buffer per thread, kept between calls */
+    if (!mem) mem = canvas_alloc();
     if (!mem) return -1;
     uint8_t pwd[15], out[32];
     memcpy(pwd, prefix, 7);
@@ -198,6 +206,5 @@ int canvas_search(const uint8_t prefix[7], const uint8_t salt[16], int bits,
             break;
         }
     }
-    canvas_free(mem);
     return ok;
 }

@@ -3,7 +3,9 @@
 
     python3 fastpow/build.py          (needs clang or gcc; CC=... to choose)
 
-The library is only kept if its hashes match a reference implementation (PyNaCl or argon2-cffi).
+Every available compiler is built with and without reference-block prefetching, each build is
+timed on this CPU the way the scripts use it, and the fastest is kept. The library is only kept
+if its hashes match a reference implementation (PyNaCl or argon2-cffi).
 paint_flag.py and the other scripts pick it up automatically from this folder.
 """
 import ctypes, os, platform, random, shutil, subprocess, sys, time
@@ -13,24 +15,63 @@ LIBNAME = {"Darwin": "libargon2_canvas.dylib", "Windows": "argon2_canvas.dll"}.g
     platform.system(), "libargon2_canvas.so")
 
 
+def _speed(path, seconds=1.2):
+    """Hashes/s of a built library, used the way the scripts use it: one search per 8-bit pixel."""
+    lib = ctypes.CDLL(path)
+    lib.canvas_search.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_uint64,
+                                  ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint64)]
+    lib.canvas_init()
+    found, start, hashes, salt = ctypes.c_uint64(), 1, 0, os.urandom(16)
+    t = time.perf_counter()
+    while time.perf_counter() - t < seconds:
+        lib.canvas_search(b"\xe9\x03\xee\x01\x00\x55\xa4", salt, 8, start, 1 << 20, ctypes.byref(found))
+        hashes += found.value - start + 1
+        start = found.value + 1
+    return hashes / (time.perf_counter() - t)
+
+
 def compile_lib():
+    """Build every available compiler x (prefetch off/on), time each here, keep the fastest."""
     out = os.path.join(HERE, LIBNAME)
     srcs = [os.path.join(HERE, "argon2_canvas.c"), os.path.join(HERE, "libargon2", "src", "blake2", "blake2b.c")]
     incs = ["-I" + os.path.join(HERE, *p) for p in ([], ["libargon2", "include"], ["libargon2", "src"])]
     x86 = platform.machine().lower() in ("x86_64", "amd64", "i386", "i686", "x86")
     arch = ["-march=native"] if x86 else []  # non-x86 (e.g. Apple Silicon): portable C path
     pic = [] if platform.system() == "Windows" else ["-fPIC"]
-    tried = []
-    for cc in ([os.environ["CC"]] if os.environ.get("CC") else []) + ["clang", "gcc", "cc"]:
-        if not shutil.which(cc) or cc in tried:
-            continue
-        tried.append(cc)
-        cmd = [cc, "-O3", *arch, "-shared", *pic, "-o", out, *incs, *srcs]
-        r = subprocess.run(cmd, capture_output=True, text=True)
-        if r.returncode == 0:
-            return out, cc
-        print(f"{cc} failed:\n{r.stderr[-1500:]}")
-    sys.exit("No working C compiler found: install clang or gcc (on Windows: MSYS2/MinGW-w64 or WSL).")
+    compilers, seen = [], set()
+    for cc in ([os.environ["CC"]] if os.environ.get("CC") else ["clang", "gcc", "cc"]):
+        real = shutil.which(cc) and os.path.realpath(shutil.which(cc))
+        if real and real not in seen:  # "cc" is often just gcc again
+            seen.add(real)
+            compilers.append(cc)
+    built = []
+    for cc in compilers:
+        for prefetch in ([False, True] if x86 else [False]):
+            path = os.path.join(HERE, f".try_{cc}_{int(prefetch)}_{LIBNAME}")
+            cmd = [cc, "-O3", *arch, *(["-DCANVAS_PREFETCH"] if prefetch else []), "-shared", *pic, "-o", path,
+                   *incs, *srcs]
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            if r.returncode == 0:
+                built.append((cc, prefetch, path))
+            elif not prefetch:
+                print(f"{cc} failed:\n{r.stderr[-1500:]}")
+    if not built:
+        sys.exit("No working C compiler found: install clang or gcc (on Windows: MSYS2/MinGW-w64 or WSL).")
+    speeds = {b: [] for b in built}
+    for _ in range(3):  # interleaved rounds: fairer than timing one build after the other
+        for b in built:
+            speeds[b].append(_speed(b[2]))
+    best = max(built, key=lambda b: sorted(speeds[b])[1])
+    for b in built:
+        mark = "  <- kept" if b == best else ""
+        print(f"  {b[0]:6s} prefetch {'on ' if b[1] else 'off'}  {sorted(speeds[b])[1]:7.0f} hashes/s{mark}")
+    shutil.copyfile(best[2], out)
+    for b in built:
+        try:
+            os.remove(b[2])
+        except OSError:
+            pass  # Windows keeps loaded DLLs locked; harmless leftovers
+    return out, f"{best[0]}{', prefetch' if best[1] else ''}"
 
 
 def reference():
