@@ -20,7 +20,7 @@ How it works:
     your own browser's YouTube cookies, or --cookies FILE. Other readers: --reader
     chat-downloader, or the official YouTube Data API with --api-key (a Google Cloud key with
     the YouTube Data API v3 enabled).
-  - The last --lines messages (3) are shown, one line "author: message" each, in a 5x7 pixel
+  - The last --lines messages (6) are shown, one line "author: message" each, in a 5x7 pixel
     font (8 px per line, see pixfont.py; --font ttf --font-size N for a normal font): author in
     French blue, message in black, on white. The panel is a ring of line slots: a new message replaces the
     oldest line and gets the ">" marker, so each message costs about one line of pixels (a
@@ -28,6 +28,10 @@ How it works:
   - Messages that are hateful by the same rules as scan_hate.py (profanity, slurs, hostile
     patterns) are skipped, links become [link], and characters the font cannot draw (most
     emoji) are dropped.
+  - New messages are picked up continuously: yt-dlp keeps polling YouTube (as often as YouTube
+    asks, every few seconds) and appends them to its file, which this script reads every second.
+    Each message is printed as it arrives, and once a minute a "listening" line says how many
+    came in and when the last one did, so a quiet chat is told apart from a stuck reader.
   - Every --interval seconds the panel is compared with the board and the differing pixels are
     painted, so it is also repaired if someone paints over it.
 """
@@ -39,6 +43,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 import paint_flag as engine
 import pixfont
+from guard_flags import CHAT_LINES
 from hate_words import hateful
 
 AUTHOR, TEXT, BG, MARK = (0x00, 0x23, 0x95), (0, 0, 0), (255, 255, 255), (0xed, 0x29, 0x39)
@@ -267,7 +272,7 @@ def main():
     ap.add_argument("--rect", nargs="+", default=["auto"], metavar="X0 Y0 X1 Y1",
                     help="panel position (inclusive), or 'auto' (default): whitest free spot, kept in chat_rect.txt")
     ap.add_argument("--new-spot", action="store_true", help="with --rect auto: choose a new spot")
-    ap.add_argument("--lines", type=int, default=3, help="how many messages to show")
+    ap.add_argument("--lines", type=int, default=CHAT_LINES, help="how many messages to show")
     ap.add_argument("--width", type=int, default=300, help="panel width for --rect auto")
     ap.add_argument("--font", choices=["pixel", "ttf"], default="pixel", help="5x7 pixel font, or a normal font")
     ap.add_argument("--font-size", type=int, default=10, help="size of the normal font (--font ttf)")
@@ -343,8 +348,9 @@ def main():
         engine._init(cfg["pow_kib"], args.max_bits, args.name)
         print(f"hashing with {engine.backend()}, {args.workers} workers", flush=True)
     pool = ThreadPoolExecutor(args.workers)
-    shown = skipped = 0
-    started = time.time()
+    shown = skipped = received = 0
+    started = beat = time.time()
+    last_msg = None
     try:
         while True:
             while True:
@@ -352,6 +358,7 @@ def main():
                     author, msg = msgs.get_nowait()
                 except queue.Empty:
                     break
+                received, last_msg = received + 1, time.time()
                 author, msg = clean(author), clean(msg)
                 if not msg or hateful(msg) or hateful(author):
                     skipped += 1
@@ -360,6 +367,13 @@ def main():
                 panel.add(author or "?", msg)
                 shown += 1
                 print(f"  {author}: {msg}", flush=True)
+            if time.time() - beat >= 60:  # heartbeat: tells a quiet chat from a stuck reader
+                beat = time.time()
+                gap = beat - last_msg if last_msg else 0
+                ago = (f"last one {gap:.0f} s ago" if gap < 120 else f"last one {gap / 60:.0f} min ago") \
+                    if last_msg else "none yet"
+                print(f"[{time.strftime('%H:%M:%S')}] listening to the chat: {received} messages so far "
+                      f"({shown} shown, {skipped} filtered), {ago}", flush=True)
             moved = chat_zone()
             if moved and (moved[0], moved[1], moved[2]) != (x0, y0, x1):
                 x0, y0, x1 = moved[0], moved[1], moved[2]

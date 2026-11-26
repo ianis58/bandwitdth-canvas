@@ -9,7 +9,7 @@ guard_flags.py paints your changes on its next round. Needs paint_flag.py and gu
     python3 flag_ui.py                 # --file to use another list, --refresh 10 (seconds)
 
 Mouse: drag on empty board = new zone of the type chosen in the toolbar (Flag / White / Text /
-       Chat: where chat_to_board.py shows the live chat, one chat zone, 3 lines high);
+       Chat: where chat_to_board.py shows the live chat, one chat zone, 6 lines high);
        drag a zone = move it; drag the square handle of the selected zone = resize it (a text zone
        re-fits its text); the buttons above the selected zone switch its painting on/off or
        delete it; right-click a zone = delete it; wheel = zoom where the mouse is; middle-drag = pan.
@@ -30,13 +30,13 @@ from PIL import Image, ImageTk
 
 import paint_flag as engine
 import pixfont
-from guard_flags import (GUARDED, add_guarded, load_guarded, move_guarded, our_art, remove_guarded,
+from guard_flags import (CHAT_LINES, GUARDED, add_guarded, load_guarded, move_guarded, our_art, remove_guarded,
                          set_enabled, zone_target)
 
 COLOURS = {"white": "ffffff", "black": "000000", "French blue": "002395", "French red": "ed2939",
            "gold": "ffd700", "none": "none"}
 DASH = {"flag": "", "white": (6, 3), "text": (2, 2), "chat": (8, 2, 2, 2)}
-CHAT_H = 3 * 8 + 1  # chat_to_board.py: 3 lines of the 5x7 pixel font
+CHAT_H = CHAT_LINES * (pixfont.HEIGHT + 1) + 1  # chat_to_board.py: CHAT_LINES lines of the 5x7 pixel font
 WS_URL = engine.BASE.replace("https://", "wss://").replace("http://", "ws://") + "/api/ws"
 
 
@@ -211,13 +211,16 @@ class FlagUI:
     # ---------------------------------------------------------------- zones
     @staticmethod
     def chat_sample(zone):
-        """What a chat zone will look like (chat_to_board.py paints it): 3 sample lines."""
+        """What a chat zone will look like (chat_to_board.py paints it): sample lines."""
         x0, y0, x1, _ = zone.rect
         w = x1 - x0 + 1
         img = np.full((CHAT_H, w, 3), 255, np.uint8)
-        for i, (who, msg) in enumerate((("Marie", "Vive la France !"), ("Tom_42", "the croissant flag was so good"),
-                                        ("Zoe", "allez les bleus"))):
-            if i == 2:
+        sample = (("Marie", "Vive la France !"), ("Tom_42", "the croissant flag was so good"),
+                  ("Zoe", "allez les bleus"), ("Lucas", "on lache rien"), ("Ines", "trop beau le drapeau"),
+                  ("Max", "who painted the QR code?"))
+        for i in range(CHAT_LINES):
+            who, msg = sample[i % len(sample)]
+            if i == CHAT_LINES - 1:
                 pixfont.draw(img, 2, 1 + i * 8, ">", (0xed, 0x29, 0x39))
             x = pixfont.draw(img, 14, 1 + i * 8, who + ": ", (0x00, 0x23, 0x95))
             pixfont.draw(img, x, 1 + i * 8, msg, (0, 0, 0))
@@ -240,6 +243,15 @@ class FlagUI:
     def reload_zones(self):
         """Re-read guarded.txt and refresh everything that depends on it."""
         self.zones = load_guarded(self.path)
+        H = self.board.shape[0] if self.board is not None else 1024
+        for z in self.zones:  # a chat zone drawn when the panel had another number of lines: real height
+            x0, y0, x1, y1 = z.rect
+            if z.kind == "chat" and y1 - y0 + 1 != CHAT_H:
+                y0 = max(0, min(y0, H - CHAT_H))
+                move_guarded(z.rect, (x0, y0, x1, y0 + CHAT_H - 1), self.path)
+                print(f"chat zone {z.rect} resized to the panel's real height ({CHAT_H} px)", flush=True)
+        if any(z.kind == "chat" and z.rect[3] - z.rect[1] + 1 != CHAT_H for z in self.zones):
+            self.zones = load_guarded(self.path)
         keys = {z.key() for z in self.zones}
         self.cache = {k: v for k, v in self.cache.items() if k in keys}
         if self.sel not in {z.rect for z in self.zones}:
@@ -395,7 +407,7 @@ class FlagUI:
             dx = max(-rect[0], min(W - 1 - rect[2], x - sx))
             dy = max(-rect[1], min(H - 1 - rect[3], y - sy))
             return (rect[0] + dx, rect[1] + dy, rect[2] + dx, rect[3] + dy)
-        if self.zone_kind(rect) == "chat":  # a chat zone only changes width: its height is 3 lines
+        if self.zone_kind(rect) == "chat":  # a chat zone only changes width: its height follows the lines
             return (rect[0], rect[1], max(rect[0] + 40, x), rect[1] + CHAT_H - 1)
         return (rect[0], rect[1], max(rect[0] + 2, x), max(rect[1] + 2, y))  # resize from the corner
 
@@ -426,7 +438,7 @@ class FlagUI:
         if rect[2] - rect[0] < 2 or rect[3] - rect[1] < 2:
             return
         kind = self.kind.get()
-        if kind == "chat":  # one chat panel: replace the previous one; height = 3 lines
+        if kind == "chat":  # one chat panel: replace the previous one; height = CHAT_LINES lines
             for z in self.zones:
                 if z.kind == "chat":
                     remove_guarded(z.rect, self.path)

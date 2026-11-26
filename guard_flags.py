@@ -30,6 +30,7 @@ FLAG = ["002395", "ffffff", "ed2939"]  # official French blue, white, red
 KINDS = ("flag", "white", "text", "chat")
 OPT_KEYS = ("fg", "ol", "bg")
 TEXT_DEFAULTS = {"fg": "ffffff", "ol": "000000", "bg": "none"}
+CHAT_LINES = 6  # messages chat_to_board.py shows; a chat zone is that many 8 px lines (+1) high
 
 
 class Zone(NamedTuple):
