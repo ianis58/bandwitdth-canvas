@@ -22,7 +22,7 @@ How it works:
      change are painted, usually far fewer than covering the word.
   4. Other hateful words are covered one by one: each word's tight box is filled with the
      colour already most common in it (white for white letters with black outlines). On our
-     own art (croissant flag, heart) our colours are used instead.
+     own art (MERCI flag, heart) our colours are used instead.
 """
 import argparse, os, re, subprocess, time
 from collections import Counter
@@ -279,8 +279,8 @@ def plan(board, ours, min_conf=60, rewrite=True):
 
 def our_art():
     """{(x, y): colour} of our own art: covers there restore our colours (no fights with the guards)."""
-    import paint_croissant_flag, paint_heart
-    ours = {(x, y): c for x, y, c in paint_croissant_flag.croissant_flag_pixels(3, 57, 506)}
+    import paint_merci_flag, paint_heart
+    ours = {(x, y): c for x, y, c in paint_merci_flag.merci_pixels()}
     ours.update({(x, y): c for x, y, c in paint_heart.heart_pixels(1001, 494)})
     return ours
 
