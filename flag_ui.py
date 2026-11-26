@@ -7,9 +7,11 @@ round. Needs paint_flag.py and guard_flags.py in the same folder.
     sudo apt install python3-tk        (Tk for Python; macOS/Windows Pythons already include it)
     python3 flag_ui.py                 # --file to use another list, --refresh 10 (seconds)
 
-Mouse: drag on the board = new flag zone, click a zone = select it, right-click a zone = delete it.
+Mouse: drag on the board = new zone (a flag or a white zone, chosen in the toolbar), click a zone
+       = select it, right-click a zone = delete it.
 Keys:  Delete / Backspace = delete the selected zone, + / - or mouse wheel = zoom, r = refresh now.
-Zone outlines: green = the flag is intact on the board, red = damaged, so guard_flags.py has work.
+Zone outlines: green = intact on the board, red = damaged (guard_flags.py has work there);
+solid = flag zone, dashed = white zone.
 """
 import argparse, os, queue, threading, time
 import tkinter as tk
@@ -61,10 +63,15 @@ class FlagUI:
         tk.Button(bar, text="Zoom -", command=lambda: self.set_zoom(self.zoom - 1)).pack(side="left")
         tk.Button(bar, text="Zoom +", command=lambda: self.set_zoom(self.zoom + 1)).pack(side="left")
         tk.Button(bar, text="Delete selected", command=self.delete_selected).pack(side="left")
+        self.kind = tk.StringVar(value="flag")
+        tk.Label(bar, text="  New zone:").pack(side="left")
+        tk.Radiobutton(bar, text="Flag", variable=self.kind, value="flag").pack(side="left")
+        tk.Radiobutton(bar, text="White", variable=self.kind, value="white").pack(side="left")
         self.status = tk.Label(bar, anchor="w")
         self.status.pack(side="left", fill="x", expand=True, padx=8)
-        tk.Label(root, anchor="w", text="drag = add a flag zone   click = select   Delete / right-click = remove   "
-                                        "+ / - / wheel = zoom   green = intact, red = damaged").pack(fill="x")
+        tk.Label(root, anchor="w", text="drag = add a zone (type chosen above)   click = select   "
+                                        "Delete / right-click = remove   + / - / wheel = zoom   "
+                                        "green = intact, red = damaged, dashed = white zone").pack(fill="x")
         frame = tk.Frame(root)
         frame.pack(fill="both", expand=True)
         self.canvas = c = tk.Canvas(frame, bg="#303030", highlightthickness=0)
@@ -123,9 +130,9 @@ class FlagUI:
         self.flags = load_guarded(self.path)
         self.state = {}
         if self.board is not None:
-            for rect, _ in self.flags:
+            for rect, _, kind in self.flags:
                 self.state[rect] = all(self.board[y, x].tobytes().hex() == c
-                                       for x, y, c in flag_target(rect, self.ours))
+                                       for x, y, c in flag_target(rect, self.ours, kind))
         if self.sel not in self.state:
             self.sel = None
         self.redraw()
@@ -142,16 +149,19 @@ class FlagUI:
         c.delete("all")
         c.create_image(0, 0, image=self.photo, anchor="nw")
         c.configure(scrollregion=(0, 0, img.width, img.height))
-        for rect, word in self.flags:
+        for rect, word, kind in self.flags:
             x0, y0, x1, y1 = rect
             col = {True: "#00e000", False: "#ff3030"}.get(self.state.get(rect), "white")
             chosen = rect == self.sel
             c.create_rectangle(x0 * z - 1, y0 * z - 1, (x1 + 1) * z, (y1 + 1) * z, outline=col,
-                               width=3 if chosen else 2, dash=(4, 2) if chosen else "")
-            if word and (z >= 2 or chosen):
-                c.create_text(x0 * z, y0 * z - 3, text=word, anchor="sw", fill=col)
+                               width=3 if chosen else 2, dash=(6, 3) if kind == "white" else "")
+            label = f"{kind}: {word}" if kind == "white" else word
+            if label and (z >= 2 or chosen):
+                c.create_text(x0 * z, y0 * z - 3, text=label, anchor="sw", fill=col)
         bad = sum(1 for v in self.state.values() if v is False)
-        self.status.config(text=f"{len(self.flags)} flag zone(s), {bad} damaged   board at {self.last}   "
+        whites = sum(1 for _, _, kind in self.flags if kind == "white")
+        self.status.config(text=f"{len(self.flags) - whites} flag + {whites} white zone(s), {bad} damaged   "
+                                f"board at {self.last}   "
                                 f"zoom {z}x   {self.path}")
 
     # mouse
@@ -159,7 +169,7 @@ class FlagUI:
         return int(self.canvas.canvasx(e.x) // self.zoom), int(self.canvas.canvasy(e.y) // self.zoom)
 
     def zone_at(self, x, y):
-        for rect, _ in reversed(self.flags):
+        for rect, *_ in reversed(self.flags):
             if rect[0] <= x <= rect[2] and rect[1] <= y <= rect[3]:
                 return rect
         return None
@@ -188,10 +198,12 @@ class FlagUI:
         rect = (max(0, min(x0, x)), max(0, min(y0, y)), min(W - 1, max(x0, x)), min(H - 1, max(y0, y)))
         if rect[2] - rect[0] < 2 or rect[3] - rect[1] < 2:
             return
-        note = simpledialog.askstring("New flag zone", f"Flag zone {rect}\nNote (optional):", parent=self.root)
+        kind = self.kind.get()
+        note = simpledialog.askstring(f"New {kind} zone", f"{kind.capitalize()} zone {rect}\nNote (optional):",
+                                      parent=self.root)
         if note is None:  # cancelled
             return
-        add_guarded(rect, note.replace("#", " ").strip() or "manual", self.path)
+        add_guarded(rect, note.replace("#", " ").strip() or "manual", self.path, kind)
         self.sel = rect
         self.reload()
 
@@ -204,7 +216,7 @@ class FlagUI:
     def delete_selected(self):
         if not self.sel:
             return
-        if messagebox.askyesno("Delete flag zone", f"Stop guarding the flag at {self.sel}?", parent=self.root):
+        if messagebox.askyesno("Delete zone", f"Stop guarding the zone at {self.sel}?", parent=self.root):
             remove_guarded(self.sel, self.path)
             self.sel = None
             self.reload()

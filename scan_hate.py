@@ -141,24 +141,29 @@ def find_hate_words(chars):
 
 
 def word_rect(board, ink, box, mode):
-    """The word's letters plus their outline (light text) or 1 px (dark text): (x0, y0, x1, y1)."""
+    """The word's letters plus their outline (light text) or 1 px (dark text): (x0, y0, x1, y1).
+    Whole letters are taken, even where tesseract's box cuts through one (e.g. a last "s")."""
     H, W = board.shape[:2]
-    x0, y0 = max(0, box[0] - 2), max(0, box[1] - 2)
-    sub = ink[y0:box[3] + 3, x0:box[2] + 3]
-    # keep only letter-height blobs: the tallest blobs are the letters; stars or specks touching
-    # the word are much shorter and are left out of the flag
-    lab, n = ndimage.label(sub, structure=np.ones((3, 3)))
+    pad = max(4, box[3] - box[1])
+    wx0, wy0 = max(0, box[0] - pad), max(0, box[1] - pad)
+    win = ink[wy0:box[3] + pad + 1, wx0:box[2] + pad + 1]
+    lab, n = ndimage.label(win, structure=np.ones((3, 3)))
     objs = ndimage.find_objects(lab)
-    if not objs:
+    # blobs touching tesseract's box (1 px slack)
+    bx0, by0, bx1, by1 = box[0] - wx0 - 1, box[1] - wy0 - 1, box[2] - wx0 + 1, box[3] - wy0 + 1
+    touch = [i for i, o in enumerate(objs, 1) if o is not None and o[1].start <= bx1 and o[1].stop > bx0
+             and o[0].start <= by1 and o[0].stop > by0]
+    if not touch:
         return None
-    tallest = max(o[0].stop - o[0].start for o in objs if o is not None)
-    letters = np.isin(lab, [i + 1 for i, o in enumerate(objs) if o is not None and o[0].stop - o[0].start >= 0.6 * tallest])
-    ys, xs = np.nonzero(letters)
+    # keep only letter-height blobs: stars or specks touching the word are much shorter
+    tallest = max(objs[i - 1][0].stop - objs[i - 1][0].start for i in touch)
+    letters = [i for i in touch if objs[i - 1][0].stop - objs[i - 1][0].start >= 0.6 * tallest]
+    ys, xs = np.nonzero(np.isin(lab, letters))
     if len(xs) < 6:
         return None
     m = (2 if ys.max() - ys.min() >= 26 else 1) + 1 if mode == "light" else 1
-    return (int(max(0, x0 + xs.min() - m)), int(max(0, y0 + ys.min() - m)),
-            int(min(W - 1, x0 + xs.max() + m)), int(min(H - 1, y0 + ys.max() + m)))
+    return (int(max(0, wx0 + xs.min() - m)), int(max(0, wy0 + ys.min() - m)),
+            int(min(W - 1, wx0 + xs.max() + m)), int(min(H - 1, wy0 + ys.max() + m)))
 
 
 def find_words(board, min_conf=60):
@@ -205,7 +210,7 @@ def main():
             time.sleep(args.interval)
             continue
         board = np.frombuffer(raw, dtype=np.uint8).reshape(-1, w, 3)
-        known = [r for r, _ in load_guarded(args.file)]
+        known = [r for r, *_ in load_guarded(args.file)]
         new = []
         for word, rect in find_words(board, args.min_conf):
             if not any(overlap(rect, r) for r in known + [n for n, _ in new]):
