@@ -11,7 +11,7 @@
 
 Options: --x 877 --y 491 --width 147   position/size (height = width * 2/3)
          --no-fox                      also paint the fox's sparkle area (see FOX_MASK)
-         --workers N                   parallel workers (default: 6 per CPU, max 48)
+         --workers N                   paints in flight, as threads (default: 16 per CPU, max 256)
          --max-bits 12                 leave pixels pricier than this for a later round
          --interval 30                 seconds between guard rounds
          --name tricolore              leaderboard name (or NAME env var)
@@ -24,7 +24,8 @@ the heat window (120 s) adds a bit to its price for *everyone*, us included. Rep
 pixels nobody touched doubles our own cost for nothing, and hot pixels cool by one bit per
 window when left alone, so pricey fights are cheaper to win a little later.
 """
-import argparse, ctypes, gzip, multiprocessing as mp, os, random, struct, sys, time
+import argparse, ctypes, gzip, os, random, struct, sys, threading, time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
@@ -78,7 +79,7 @@ def argon2id(pwd, salt):
 BASE = "https://canvas.bandwidthyt.com"
 COLORS = ["0055a4", "ffffff", "ef4135"]
 
-_session = None
+_local = threading.local()  # one HTTP session per worker thread
 _kib = 1024
 _max_bits = 12
 _name = "tricolore"
@@ -178,24 +179,30 @@ def _time(f, pwd, want, seconds):
 
 
 def _init(kib, max_bits, name):
-    global _session, _kib, _max_bits, _name
+    global _kib, _max_bits, _name
     _kib, _max_bits, _name = kib, max_bits, name
-    _session = requests.Session()
-    random.seed(os.urandom(16))
+
+
+def _sess():
+    s = getattr(_local, "s", None)
+    if s is None:
+        s = _local.s = requests.Session()
+    return s
 
 
 def paint_one(task):
     x, y, color = task
     rgb = bytes.fromhex(color)
+    session = _sess()
     for attempt in range(12):
         try:
-            c = _session.get(f"{BASE}/api/challenge", params={"x": x, "y": y}, timeout=20).json()
+            c = session.get(f"{BASE}/api/challenge", params={"x": x, "y": y}, timeout=20).json()
             if c["bits"] > _max_bits:  # too hot right now; it cools if left alone
                 return (x, y, "deferred", c["bits"])
             nonce = solve(bytes.fromhex(c["epoch"]), x, y, rgb, c["bits"])
-            r = _session.post(f"{BASE}/api/paint", timeout=20,
-                              json={"x": x, "y": y, "color": color, "epoch": c["epoch"],
-                                    "nonce": nonce, "name": _name})
+            r = session.post(f"{BASE}/api/paint", timeout=20,
+                             json={"x": x, "y": y, "color": color, "epoch": c["epoch"],
+                                   "nonce": nonce, "name": _name})
         except (requests.RequestException, ValueError, KeyError):
             time.sleep(min(30, 2 ** attempt))
             continue
@@ -206,8 +213,8 @@ def paint_one(task):
         if r.status_code == 429:
             time.sleep(61)
             continue
-        if r.status_code == 403:
-            return (x, y, "closed", 0)
+        if r.status_code == 403:  # board closed, or a short refusal: leave it for a later round
+            return (x, y, "refused", 0)
         time.sleep(1)
     return (x, y, "fail", 0)
 
@@ -232,10 +239,10 @@ def run_pass(pool, tasks, label):
     random.shuffle(tasks)
     total, counts, t0 = len(tasks), {}, time.time()
     print(f"{label}: {total} pixels to paint", flush=True)
-    for i, (x, y, status, bits) in enumerate(pool.imap_unordered(paint_one, tasks, chunksize=4), 1):
+    futures = [pool.submit(paint_one, t) for t in tasks]
+    for i, fut in enumerate(as_completed(futures), 1):
+        x, y, status, bits = fut.result()
         counts[status] = counts.get(status, 0) + 1
-        if status == "closed":
-            sys.exit("board closed")
         if i % 250 == 0 or i == total:
             el = time.time() - t0
             print(f"  {i}/{total} {counts} {i / el:.1f} px/s eta {(total - i) / (i / el):.0f}s", flush=True)
@@ -249,7 +256,8 @@ def add_common_args(ap, x, y):
     ap.add_argument("--width", type=int, default=147)
     ap.add_argument("--no-fox", action="store_true",
                     help="also paint over the areas left to neighbours (fox art, Exil_S's heart)")
-    ap.add_argument("--workers", type=int, default=min(48, 6 * (os.cpu_count() or 4)))
+    ap.add_argument("--workers", type=int, default=min(256, 16 * (os.cpu_count() or 4)),
+                    help="parallel paints in flight (threads); most of their time is network wait")
     ap.add_argument("--max-bits", type=int, default=12)
     ap.add_argument("--name", default=os.environ.get("NAME", "tricolore"))
     ap.add_argument("--fix", action="store_true", help="only repaint pixels that differ on the board")
@@ -275,12 +283,12 @@ def run(pixels, args, what):
     cfg = requests.get(f"{BASE}/api/config", timeout=20).json()
     if cfg.get("read_only"):
         sys.exit("board is read-only")
-    global _kib
-    _kib = cfg["pow_kib"]
+    _init(cfg["pow_kib"], args.max_bits, args.name)
     print(f"{what}, name {args.name!r}, {args.workers} workers, hashing with {backend()}", flush=True)
 
-    with mp.Pool(args.workers, initializer=_init,
-                 initargs=(cfg["pow_kib"], args.max_bits, args.name)) as pool:
+    # Threads, not processes: a worker mostly waits on the network, and the hashing (C library,
+    # libsodium or libargon2) runs outside Python's GIL, so threads still use every core.
+    with ThreadPoolExecutor(args.workers) as pool:
         try:
             if not args.guard:
                 tasks = damaged(pixels) if args.fix else list(pixels)
@@ -290,6 +298,9 @@ def run(pixels, args, what):
             while True:
                 rnd += 1
                 try:
+                    if requests.get(f"{BASE}/api/config", timeout=20).json().get("read_only"):
+                        print("board is read-only now: stopping", flush=True)
+                        return
                     tasks = damaged(pixels)
                 except requests.RequestException as e:
                     print(f"round {rnd}: board fetch failed ({e}), retrying", flush=True)
@@ -304,8 +315,9 @@ def run(pixels, args, what):
                     print(f"[{stamp}] round {rnd}: flag 100% intact", flush=True)
                 time.sleep(args.interval)
         except KeyboardInterrupt:
-            pool.terminate()
+            pool.shutdown(wait=False, cancel_futures=True)
             print("\nstopped", flush=True)
+            os._exit(130)
 
 
 if __name__ == "__main__":
