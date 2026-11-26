@@ -194,6 +194,7 @@ def _sess():
 
 def paint_one(task):
     x, y, color = task
+    x, y = int(x), int(y)  # numpy integers are not JSON serialisable
     rgb = bytes.fromhex(color)
     session = _sess()
     for attempt in range(12):

@@ -222,7 +222,7 @@ def rewrite_pixels(board, ink, box, new_word, mode):
     if best is None:
         return []
     _, target, changed = best
-    return [(rx0 + x, ry0 + y, target[y, x].tobytes().hex()) for y, x in zip(*np.nonzero(changed))]
+    return [(int(rx0 + x), int(ry0 + y), target[y, x].tobytes().hex()) for y, x in zip(*np.nonzero(changed))]
 
 
 def cover_pixels(board, ink, box, ours, mode):
@@ -241,7 +241,7 @@ def cover_pixels(board, ink, box, ours, mode):
         for x in range(bx0, bx1):
             want = ours.get((x, y), fill)
             if board[y, x].tobytes().hex() != want:
-                out.append((x, y, want))
+                out.append((int(x), int(y), want))
     return out
 
 
