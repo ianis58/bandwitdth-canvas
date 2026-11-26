@@ -23,7 +23,7 @@ Same options as the other scripts: --workers, --max-bits, --batch, --shard K/N, 
 import argparse, functools, os, subprocess, time
 from typing import NamedTuple
 
-from paint_flag import run
+from paint_flag import default_workers, run
 
 GUARDED = os.path.join(os.path.dirname(os.path.abspath(__file__)), "guarded.txt")
 FLAG = ["002395", "ffffff", "ed2939"]  # official French blue, white, red
@@ -249,7 +249,7 @@ def main():
     ap.add_argument("--once", action="store_true", help="a single repair pass instead of guarding")
     ap.add_argument("--file", default=GUARDED, help="zone list to read (default guarded.txt next to this script)")
     ap.add_argument("--no-ours", action="store_true", help="paint zones even over our own art")
-    ap.add_argument("--workers", type=int, default=min(256, 16 * (os.cpu_count() or 4)))
+    ap.add_argument("--workers", type=int, default=default_workers())
     ap.add_argument("--max-bits", type=int, default=12)
     ap.add_argument("--batch", type=int, default=3000)
     ap.add_argument("--shard", default="0/1")

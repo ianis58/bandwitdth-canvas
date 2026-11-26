@@ -34,7 +34,7 @@ import argparse, os
 import numpy as np
 from PIL import Image, ImageFilter
 
-from paint_flag import fetch_board, run
+from paint_flag import default_workers, fetch_board, run
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_IMAGE = os.path.join(HERE, "art", "duo.png")
@@ -169,7 +169,7 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="save image_preview.png and exit, paint nothing")
     ap.add_argument("--zones-off", action="store_true", help="switch off guarded.txt zones under the picture")
     ap.add_argument("--guard", action="store_true", help="keep repairing the picture until Ctrl-C")
-    ap.add_argument("--workers", type=int, default=min(256, 16 * (os.cpu_count() or 4)))
+    ap.add_argument("--workers", type=int, default=default_workers())
     ap.add_argument("--max-bits", type=int, default=12)
     ap.add_argument("--batch", type=int, default=3000)
     ap.add_argument("--shard", default="0/1")

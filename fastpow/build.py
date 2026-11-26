@@ -115,10 +115,16 @@ def compile_lib():
         threads = max(per, key=per.get)
         print(f"  hashing threads: {physical} -> {per[physical]:.0f} hashes/s, {logical} -> {per[logical]:.0f} hashes/s"
               f"  -> using {threads}")
-    with open(os.path.join(HERE, "tuning.json"), "w") as f:
-        json.dump({"hash_threads": threads, "logical_cpus": logical, "physical_cores": physical,
+    try:  # keep what other tools saved there (tune.py's workers)
+        with open(os.path.join(HERE, "tuning.json")) as f:
+            tuning = json.load(f)
+    except (OSError, ValueError):
+        tuning = {}
+    tuning.update({"hash_threads": threads, "logical_cpus": logical, "physical_cores": physical,
                    "build": f"{best[0]} {best[1]}{' prefetch' if best[2] else ''}",
-                   "hashes_per_s": round(sum(speeds[best]) / 2)}, f, indent=1)
+                   "hashes_per_s": round(sum(speeds[best]) / 2)})
+    with open(os.path.join(HERE, "tuning.json"), "w") as f:
+        json.dump(tuning, f, indent=1)
     shutil.copyfile(best[3], out)
     for b in built:
         try:

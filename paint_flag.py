@@ -11,7 +11,8 @@
 
 Options: --x 877 --y 491 --width 147   position/size (height = width * 2/3)
          --no-fox                      also paint the fox's sparkle area (see FOX_MASK)
-         --workers N                   paints in flight, as threads (default: 16 per CPU, max 256)
+         --workers N                   paints in flight, as threads (default: measured by tune.py,
+                                       else 16 per CPU thread, max 256; or the WORKERS env var)
          --max-bits 12                 leave pixels pricier than this for a later round
          --interval 30                 seconds between guard rounds (when nothing is left to do)
          --batch 3000                  guard: at most this many pixels per round, worst first
@@ -80,10 +81,11 @@ def backend():
     return "libsodium (PyNaCl)" if _nacl else "argon2-cffi"
 
 
-def argon2id(pwd, salt):
+def argon2id(pwd, salt, kib=None):
+    kib = kib or _kib
     if _nacl:
-        return _nacl.kdf(32, pwd, salt, opslimit=1, memlimit=_kib * 1024)
-    return hash_secret_raw(pwd, salt, time_cost=1, memory_cost=_kib, parallelism=1, hash_len=32, type=Type.ID)
+        return _nacl.kdf(32, pwd, salt, opslimit=1, memlimit=kib * 1024)
+    return hash_secret_raw(pwd, salt, time_cost=1, memory_cost=kib, parallelism=1, hash_len=32, type=Type.ID)
 
 BASE = "https://canvas.bandwidthyt.com"
 COLORS = ["0055a4", "ffffff", "ef4135"]
@@ -128,6 +130,26 @@ def flag_pixels(ox, oy, width, skip=FOX_PIXELS):
             yield ox + x, oy + y, COLORS[min(2, int(x // band))]
 
 
+TUNING_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fastpow", "tuning.json")
+
+
+def _tuning():
+    """fastpow/tuning.json: hash_threads (fastpow/build.py) and workers (tune.py), or {}."""
+    try:
+        with open(TUNING_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def default_workers():
+    """--workers default: WORKERS env var, else measured by tune.py, else 16 per CPU thread (max 256)."""
+    try:
+        return max(1, int(os.environ.get("WORKERS") or _tuning()["workers"]))
+    except (KeyError, ValueError, TypeError):
+        return min(256, 16 * (os.cpu_count() or 4))
+
+
 def _hash_threads():
     """How many threads may hash at once: HASH_THREADS env var, else fastpow/tuning.json (measured
     by fastpow/build.py: on Hyper-Threading CPUs one hash per physical core can be faster, since
@@ -135,9 +157,8 @@ def _hash_threads():
     if os.environ.get("HASH_THREADS"):
         return max(1, int(os.environ["HASH_THREADS"]))
     try:
-        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "fastpow", "tuning.json")) as f:
-            return max(1, int(json.load(f)["hash_threads"]))
-    except (OSError, ValueError, KeyError):
+        return max(1, int(_tuning()["hash_threads"]))
+    except (KeyError, ValueError, TypeError):
         return os.cpu_count() or 4
 
 
@@ -179,16 +200,20 @@ def solve_split(prefix, epoch, bits, nonce, ways):
     return result[0]
 
 
-def solve(epoch, x, y, rgb, bits):
+def solve(epoch, x, y, rgb, bits, kib=None):
+    """A nonce whose hash has `bits` leading zero bits. kib: the challenge's Argon2 memory (the
+    server may change it at any epoch); the fastpow library only does 1024 KiB, the others any."""
+    kib = kib or _kib
+    fast = _fast and kib == 1024
     prefix = struct.pack("<HH", x, y) + rgb
     nonce = random.getrandbits(62)  # random start: a repeat paint must not find a used solution
     # pricey pixels are shared by several cores: 1 thread at 8 bits, 2 at 9, 4 at 10 ... all cores
     # from 12 bits; the overshoot (at most one hash per thread) stays under 1/256 of the work
     ways = min(CORES, 1 << max(0, bits - 8))
-    if _fast and _kib == 1024 and ways > 1 and hasattr(_fast, "canvas_search_stop"):
+    if fast and ways > 1 and hasattr(_fast, "canvas_search_stop"):
         return solve_split(prefix, epoch, bits, nonce, ways)
     with _hash_slots:
-        if _fast and _kib == 1024:  # whole search loop in C, 65536 nonces per call
+        if fast:  # whole search loop in C, 65536 nonces per call
             found = ctypes.c_uint64()
             while True:
                 r = _fast.canvas_search(prefix, epoch, bits, nonce, 1 << 16, ctypes.byref(found))
@@ -199,7 +224,7 @@ def solve(epoch, x, y, rgb, bits):
                 nonce += 1 << 16
         limit = 1 << (256 - bits)
         while True:
-            if int.from_bytes(argon2id(prefix + struct.pack("<Q", nonce), epoch), "big") < limit:
+            if int.from_bytes(argon2id(prefix + struct.pack("<Q", nonce), epoch, kib), "big") < limit:
                 return nonce
             nonce += 1
 
@@ -256,6 +281,15 @@ def _sess():
     return s
 
 
+_warned = set()
+
+
+def _warn_once(msg):
+    if msg not in _warned:
+        _warned.add(msg)
+        print(f"WARNING: {msg}", flush=True)
+
+
 def paint_one(task):
     x, y, color = task
     x, y = int(x), int(y)  # numpy integers are not JSON serialisable
@@ -266,7 +300,12 @@ def paint_one(task):
             c = session.get(f"{BASE}/api/challenge", params={"x": x, "y": y}, timeout=20).json()
             if c["bits"] > _max_bits:  # too hot right now; it cools if left alone
                 return (x, y, "deferred", c["bits"])
-            nonce = solve(bytes.fromhex(c["epoch"]), x, y, rgb, c["bits"])
+            kib = int(c.get("kib") or _kib)  # may change at any epoch: hashing with another is refused
+            if kib != 1024 and not (_nacl or hash_secret_raw):
+                _warn_once(f"the server now wants {kib} KiB hashes: the fastpow library only does 1024; "
+                           f"pip install pynacl to paint meanwhile")
+                return (x, y, "deferred", c["bits"])
+            nonce = solve(bytes.fromhex(c["epoch"]), x, y, rgb, c["bits"], kib)
             r = session.post(f"{BASE}/api/paint", timeout=20,
                              json={"x": x, "y": y, "color": color, "epoch": c["epoch"],
                                    "nonce": nonce, "name": _name})
@@ -341,8 +380,9 @@ def add_common_args(ap, x, y):
     ap.add_argument("--width", type=int, default=147)
     ap.add_argument("--no-fox", action="store_true",
                     help="also paint over the areas left to neighbours (fox art, Exil_S's heart)")
-    ap.add_argument("--workers", type=int, default=min(256, 16 * (os.cpu_count() or 4)),
-                    help="parallel paints in flight (threads); most of their time is network wait")
+    ap.add_argument("--workers", type=int, default=default_workers(),
+                    help="parallel paints in flight (threads); most of their time is network wait "
+                         "(default: measured by tune.py)")
     ap.add_argument("--max-bits", type=int, default=12)
     ap.add_argument("--name", default=os.environ.get("NAME", "tricolore"))
     ap.add_argument("--fix", action="store_true", help="only repaint pixels that differ on the board")

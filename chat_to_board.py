@@ -286,7 +286,7 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="no painting: save chat_preview.png after a few messages")
     ap.add_argument("--interval", type=float, default=3, help="seconds between panel updates")
     ap.add_argument("--preview-after", type=float, default=40, help="--dry-run: seconds of chat to collect")
-    ap.add_argument("--workers", type=int, default=min(128, 8 * (os.cpu_count() or 4)))
+    ap.add_argument("--workers", type=int, default=engine.default_workers())
     ap.add_argument("--max-bits", type=int, default=11)
     ap.add_argument("--name", default=os.environ.get("NAME", "tricolore"))
     args = ap.parse_args()

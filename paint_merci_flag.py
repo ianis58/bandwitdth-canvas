@@ -16,7 +16,7 @@ fixed; the letters keep rix's gold, black and edge-shading colours. Updated afte
 """
 import argparse, base64, os, zlib
 
-from paint_flag import run
+from paint_flag import default_workers, run
 
 AT = (105, 62)
 W, H = 320, 330
@@ -292,7 +292,7 @@ def main():
     ap = argparse.ArgumentParser(description="Paint and guard rix's VIVE LA FRANCE / MERCI flag.")
     ap.add_argument("--guard", action="store_true", help="repair damaged pixels in a loop until Ctrl-C")
     ap.add_argument("--fix", action="store_true", help="only repaint pixels that differ on the board")
-    ap.add_argument("--workers", type=int, default=min(256, 16 * (os.cpu_count() or 4)))
+    ap.add_argument("--workers", type=int, default=default_workers())
     ap.add_argument("--max-bits", type=int, default=12)
     ap.add_argument("--batch", type=int, default=3000)
     ap.add_argument("--shard", default="0/1")

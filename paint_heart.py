@@ -12,7 +12,7 @@ Don't run it together with paint_flag.py --guard: the heart sits inside that fla
 """
 import argparse, os
 
-from paint_flag import run
+from paint_flag import default_workers, run
 
 COLORS = {
     "o": "14213d",  # outline, dark navy (the heart sits on white)
@@ -54,7 +54,7 @@ def main():
     ap.add_argument("--x", type=int, default=1001)
     ap.add_argument("--y", type=int, default=494)
     ap.add_argument("--once", action="store_true", help="paint once and exit instead of guarding")
-    ap.add_argument("--workers", type=int, default=min(32, 4 * (os.cpu_count() or 4)))
+    ap.add_argument("--workers", type=int, default=default_workers())
     ap.add_argument("--max-bits", type=int, default=12)
     ap.add_argument("--interval", type=float, default=20)
     ap.add_argument("--name", default=os.environ.get("NAME", "tricolore"))
