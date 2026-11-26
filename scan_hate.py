@@ -32,23 +32,7 @@ from scipy import ndimage
 
 import paint_flag as engine
 from guard_flags import GUARDED, add_guarded, flag_target, load_guarded, overlap
-
-# hater words to cover; when several match, exact and longer matches win
-HATE_KEYS = ["DISGUSTING", "PATHETIC", "FUCKING", "GARBAGE", "FUCKED", "FUCKER", "HATERS", "LOSERS", "PHUCK", "SUCKS",
-             "HATER", "HATES", "HATED", "DEATH", "LOSER", "TRASH", "FUCK", "SUCK", "HATE", "KILL", "STFU", "SCUM",
-             "SHIT", "FCK", "FUK", "SUX", "DIE", "KYS"]
-HOSTILE = [r"\bshit", r"\bgarbage\b", r"\bsux\b",
-    r"\bhate[sd]?\b", r"\bhating\b", r"\bhaters?\b", r"\bsucks?\b", r"\bdeath\s+to\b", r"\bkill\b",
-    r"\bdie\b", r"\bf+[\W_]*[u*]*[\W_]*c+[\W_]*k+", r"\bstfu\b", r"\bkys\b", r"\bgo\s+home\b",
-    r"\bscum\b", r"\btrash\b", r"\bpathetic\b", r"\bloser?s?\b", r"\bdisgusting\b",
-]
-LEET = str.maketrans({"0": "o", "1": "i", "3": "e", "4": "a", "5": "s", "7": "t", "@": "a", "$": "s", "|": "l"})
-SCALE = 3
-# identity words are not hate on their own (and may well be pride messages): never cover them
-IDENTITY = ["gay", "gays", "lesbian", "lesbians", "queer", "queers", "trans", "transgender", "bi", "bisexual",
-            "lgbt", "lgbtq", "homosexual", "pride", "nonbinary"]
-profanity.load_censor_words(whitelist_words=IDENTITY)
-
+from hate_words import HATE_KEYS, LEET, SCALE, hateful, norm
 
 def luminance(a):
     return 0.299 * a[..., 0] + 0.587 * a[..., 1] + 0.114 * a[..., 2]
@@ -81,15 +65,6 @@ def ocr_lines(mask):
             box = (x0, y0, x0 + d["width"][i] // SCALE, y0 + d["height"][i] // SCALE)
             lines.setdefault((d["block_num"][i], d["par_num"][i], d["line_num"][i]), []).append((word, conf, box))
     return [(" ".join(w for w, _, _ in ws), ws) for ws in lines.values()]
-
-
-def norm(text):
-    return re.sub(r"[^a-z\s*]", " ", text.lower().translate(LEET))
-
-
-def hateful(text):
-    t = norm(text)
-    return profanity.contains_profanity(t) or any(re.search(p, t) for p in HOSTILE)
 
 
 def char_boxes(mask, box):
