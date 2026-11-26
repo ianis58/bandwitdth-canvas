@@ -167,15 +167,16 @@ def most_common(pixels):
     return Counter(map(bytes, pixels)).most_common(1)[0][0].hex()
 
 
-def rewrite_pixels(board, ink, box, new_word, mode):
-    """Pixels to paint to turn the word in `box` into `new_word`, same style. [] if unsure."""
+def rewrite_pixels(board, ink, box, new_word, mode, tol=60):
+    """Pixels to paint to turn the word in `box` into `new_word`, same style. [] if unsure.
+    Pixels already within `tol` (sum of RGB differences) of their target are left alone."""
     H, W = board.shape[:2]
     x0, y0 = max(0, box[0] - 2), max(0, box[1] - 2)
     ys, xs = np.nonzero(ink[y0:box[3] + 3, x0:box[2] + 3])
     if len(xs) < 10:
         return []
     lx0, ly0, lx1, ly1 = x0 + xs.min(), y0 + ys.min(), x0 + xs.max(), y0 + ys.max()
-    t = 2 if mode == "light" else 0                       # outline thickness
+    t = (1 if ly1 - ly0 < 26 else 2) if mode == "light" else 0   # outline thickness, by letter height
     rx0, ry0 = max(0, lx0 - t - 2), max(0, ly0 - t - 2)
     rx1, ry1 = min(W, lx1 + t + 3), min(H, ly1 + t + 3)
     sub = board[ry0:ry1, rx0:rx1]
@@ -216,7 +217,7 @@ def rewrite_pixels(board, ink, box, new_word, mode):
                     else np.zeros_like(new)
                 target = np.where(new[..., None], rgb(fill), np.where(new_outline[..., None], rgb(outline),
                                   np.where(old_text[..., None], bg, sub)))
-                changed = (target != sub).any(axis=2)
+                changed = np.abs(target.astype(np.int16) - sub.astype(np.int16)).sum(axis=2) > tol
                 if best is None or changed.sum() < best[0]:
                     best = (int(changed.sum()), target, changed)
     if best is None:
