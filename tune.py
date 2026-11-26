@@ -2,10 +2,13 @@
 """Find the best --workers for this computer and connection, and save it: every paint script
 then uses it by default (in fastpow/tuning.json, next to the hashing-thread count that
 fastpow/build.py saves there). Run fastpow/build.py first if you use the fast C library.
+Stop the other paint scripts while it runs: they share the CPU and would skew the test.
 
-    python3 tune.py            # ~2-3 min: measure, live test, save
-    python3 tune.py --quick    # ~20 s: estimate from CPU and network alone, paints nothing
-    python3 tune.py --no-save  # show the result without saving it
+    python3 tune.py                      # ~8-10 min: measure, 2 min live trial per worker count, save
+    python3 tune.py --levels 128 256 400 # compare exactly these worker counts
+    python3 tune.py --rounds 2           # every count twice, in alternating order (cancels drift)
+    python3 tune.py --quick              # ~10 s: estimate from CPU and network alone, paints nothing
+    python3 tune.py --no-save            # show the result without saving it
 
 What a worker is: one pixel in flight. Each pixel asks the server for its price (one round trip),
 hashes until it finds a solution (CPU: at most one hash per hashing thread at a time, other
@@ -20,18 +23,24 @@ Steps:
   3. Estimate: hashing threads + pixels/s x time on the network per pixel, x2 (a paint request
      takes longer than a price request: the server checks the hash; too many workers costs
      little, too few costs speed).
-  4. Live test (not with --quick): repaints pixels of our MERCI flag that are intact with the
-     colour they already have (nothing visibly changes), with several worker counts around the
-     estimate, ~15 s each, and measures the pixels per second really reached. Those pixels get
-     one bit of heat for a few minutes, which only makes them dearer for others to change.
-     --area X0 Y0 X1 Y1 tests on another area instead (repainted with its current colours).
+  4. Live test (not with --quick): paints for --seconds (default 120) per worker count, keeping
+     that many workers busy the whole time, and counts the pixels per second. Default counts:
+     half, once and twice the estimate, plus more while the speed still climbs at an end.
+     Before each trial 10 s are not counted (threads and connections start); before the first
+     one 45 s, so a laptop CPU has dropped from its short turbo boost to the speed it keeps.
+     Each trial is also cut into 30 s windows: their lowest and highest speeds show how much it
+     varies by itself (other players' load on the server, the network), so differences smaller
+     than that are noise.
+     The pixels painted are intact pixels of our MERCI flag, with the colour they already have
+     (nothing visibly changes; they get a bit of heat for a few minutes, which only makes them
+     dearer for others to change). --area X0 Y0 X1 Y1 uses another area, with its current colours.
   5. Keeps the fewest workers within 5 % of the best speed.
 
 Afterwards --workers N on any script, or the WORKERS environment variable, still overrides it.
 Run it again if your connection changes (other place, other network) or after fastpow/build.py.
 """
 import argparse, ctypes, json, os, random, statistics, struct, threading, time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 import requests
 
@@ -102,20 +111,55 @@ def test_pixels(area):
     return [(x, y, c) for x, y, c in paint_merci_flag.merci_pixels() if now(x, y) == c]  # intact ones only
 
 
-def live_trial(workers, tasks, base_bits):
-    """(fresh-pixel equivalents per second in the steady part, status counts)."""
+class Feed:
+    """Endless supply of test pixels, shuffled; the list is re-read from the board when used up."""
+
+    def __init__(self, area):
+        self.area, self.items, self.i, self.loads = area, [], 0, 0
+
+    def __call__(self):
+        if self.i >= len(self.items):
+            self.items, self.i = test_pixels(self.area), 0
+            random.Random(self.loads).shuffle(self.items)
+            self.loads += 1
+            if not self.items:
+                raise SystemExit("no intact test pixels left: use --area X0 Y0 X1 Y1")
+        self.i += 1
+        return self.items[self.i - 1]
+
+
+def live_trial(workers, feed, seconds, warm, base_bits, window):
+    """Paint for warm + seconds with `workers` always busy. Returns (px/s over the counted
+    `seconds`, [px/s of each window], status counts). A pixel at b bits counts 2^(b - base)
+    fresh ones, since hot pixels cost more work."""
     done, counts = [], {}
     t0 = time.perf_counter()
+    start, end = t0 + warm, t0 + warm + seconds
+    flying = set()
     with ThreadPoolExecutor(workers) as pool:
-        for fut in as_completed([pool.submit(engine.paint_one, t) for t in tasks]):
-            _, _, status, bits = fut.result()
-            counts[status] = counts.get(status, 0) + 1
-            # a pixel at b bits is worth 2^(b - base) fresh ones (hot pixels cost more)
-            done.append((time.perf_counter() - t0, 2.0 ** (bits - base_bits) if status == "ok" else 0.0))
-    # steady state only: between the 10 % and 85 % completion marks (not the start-up, not the tail)
-    a, b = len(done) // 10, int(len(done) * 0.85)
-    span = done[b][0] - done[a][0]
-    return (sum(v for _, v in done[a + 1:b + 1]) / span if span > 0 else 0.0), counts
+        while True:
+            if time.perf_counter() < end:
+                while len(flying) < 2 * workers:  # a queue a bit deeper than the workers: none waits for work
+                    flying.add(pool.submit(engine.paint_one, feed()))
+            else:  # time is up: drop the queued pixels; those being painted finish, uncounted
+                for f in flying:
+                    f.cancel()
+                flying = {f for f in flying if not f.cancelled()}
+                if not flying:
+                    break
+            finished, flying = wait(flying, timeout=1.0, return_when=FIRST_COMPLETED)
+            now = time.perf_counter()
+            for f in finished:
+                _, _, status, bits = f.result()
+                if start <= now < end:
+                    counts[status] = counts.get(status, 0) + 1
+                    if status == "ok":
+                        done.append((now - start, 2.0 ** (bits - base_bits)))
+    n = max(1, int(seconds // window))
+    per = [0.0] * n
+    for t, v in done:
+        per[min(n - 1, int(t * n / seconds))] += v
+    return sum(v for _, v in done) / seconds, [p * n / seconds for p in per], counts
 
 
 def nice(n):
@@ -126,7 +170,13 @@ def main():
     ap = argparse.ArgumentParser(description="Find and save the best --workers for this computer.")
     ap.add_argument("--quick", action="store_true", help="estimate only (CPU + network), paint nothing")
     ap.add_argument("--no-save", action="store_true", help="do not write fastpow/tuning.json")
-    ap.add_argument("--seconds", type=float, default=15, help="length of each live trial")
+    ap.add_argument("--seconds", type=float, default=120, help="counted length of each live trial (default 120)")
+    ap.add_argument("--levels", type=int, nargs="+", metavar="N", help="worker counts to compare (default: "
+                    "half, once and twice the estimate, extended while the speed still climbs at an end)")
+    ap.add_argument("--rounds", type=int, default=1,
+                    help="run every count this many times, in alternating order (cancels slow drift)")
+    ap.add_argument("--window", type=float, default=30, help="seconds per window for the spread (default 30)")
+    ap.add_argument("--preheat", type=float, default=45, help="uncounted seconds before the first trial")
     ap.add_argument("--area", type=int, nargs=4, metavar=("X0", "Y0", "X1", "Y1"),
                     help="live test on this area (repainted with its current colours) instead of the MERCI flag")
     ap.add_argument("--name", default=os.environ.get("NAME", "tricolore"))
@@ -162,42 +212,65 @@ def main():
 
     # 4. live test
     if not args.quick:
-        pool = test_pixels(args.area)
-        random.Random(1).shuffle(pool)
-        levels = sorted({nice(est * f) for f in (0.25, 0.5, 1, 2)})
-        print(f"4. live test on {len(pool):,} {'area' if args.area else 'intact MERCI flag'} pixels, "
-              f"repainted with the colour they already have, ~{args.seconds:.0f} s per trial:", flush=True)
-        used = 0
-        i = 0
-        while i < len(levels):
-            w = levels[i]
-            expect = min(cpu_px, w / per_px)  # Little's law: w in flight, each ~per_px seconds
-            n = int(min(6000, max(3 * w, expect * args.seconds)))
-            if used + n > len(pool):  # area used up: start again (those pixels are a bit hotter)
-                used = 0
-                pool = test_pixels(args.area)
-                random.Random(i + 2).shuffle(pool)
-            rate, counts = live_trial(w, pool[used:used + n], base)
-            used += n
-            results[w] = rate
-            print(f"   {w:5d} workers: {rate:6.1f} px/s   {counts}", flush=True)
-            i += 1
-            if i == len(levels):  # still rising at the top (or bottom) of the range: look further
-                top = max(results, key=results.get)
-                ranked = sorted(results)
-                if top == ranked[-1] and len(ranked) > 1 and results[top] > 1.05 * results[ranked[-2]] \
-                        and top < MAX_WORKERS:
-                    levels.append(nice(top * 2))
-                elif top == ranked[0] and top > cores and len(ranked) > 1 \
-                        and results[top] > 1.05 * results[ranked[1]]:
-                    levels.append(nice(top / 2))
-                levels = list(dict.fromkeys(levels))
+        feed = Feed(args.area)
+        fixed = bool(args.levels)
+        levels = sorted({max(1, min(MAX_WORKERS, n)) for n in args.levels}) if fixed else \
+            sorted({nice(est * f) for f in (0.5, 1, 2)})
+        trial_s = args.seconds + 10
+        mins = (len(levels) * args.rounds * trial_s + args.preheat - 10) / 60
+        print(f"4. live test: {levels} workers, {args.seconds:.0f} s counted each, {args.rounds} round(s): "
+              f"about {mins:.0f} min{'' if fixed else ' (more if the speed still climbs at an end)'}; "
+              f"repainting intact {'area' if args.area else 'MERCI flag'} pixels with the colour they already have",
+              flush=True)
+        runs = {}  # workers -> [(px/s, [window px/s])]
+        first = True
+
+        def trial(w):
+            nonlocal first
+            warm = args.preheat if first else 10.0
+            first = False
+            rate, wins, counts = live_trial(w, feed, args.seconds, warm, base, args.window)
+            runs.setdefault(w, []).append((rate, wins))
+            print(f"   [{time.strftime('%H:%M:%S')}] {w:5d} workers: {rate:6.1f} px/s   "
+                  f"({args.window:.0f} s windows: {min(wins):.0f}-{max(wins):.0f})   {counts}", flush=True)
+
+        def mean(w):
+            return statistics.mean(r for r, _ in runs[w])
+
+        todo = list(levels)
+        for extension in range(4):
+            for r in range(args.rounds):
+                for w in (todo if r % 2 == 0 else todo[::-1]):
+                    trial(w)
+            if fixed:
+                break
+            ranked = sorted(runs)
+            top = max(ranked, key=mean)
+            if top == ranked[-1] and top < MAX_WORKERS and mean(top) > 1.05 * mean(ranked[-2]):
+                todo = [nice(top * 2)]  # still climbing at the top: try more
+            elif top == ranked[0] and top > cores and mean(top) > 1.05 * mean(ranked[1]):
+                todo = [nice(top / 2)]  # still climbing at the bottom: try fewer
+            else:
+                break
+            if todo[0] in runs:
+                break
+            print(f"   speed still climbing at {top} workers: also trying {todo[0]}", flush=True)
+
+        results = {w: round(mean(w), 1) for w in sorted(runs)}
+        spread = statistics.median((max(wins) - min(wins)) / 2 / max(1e-9, statistics.mean(wins))
+                                   for rs in runs.values() for _, wins in rs)
         top_rate = max(results.values())
         best = min(w for w, r in results.items() if r >= 0.95 * top_rate)  # fewest within 5 % of the best
-        print(f"5. best: {best} workers ({results[best]:.0f} px/s; top speed {top_rate:.0f} px/s)", flush=True)
+        print("5. summary (mean px/s per worker count):", flush=True)
+        for w, r in results.items():
+            wins = [x for _, ws in runs[w] for x in ws]
+            print(f"   {w:5d} workers: {r:6.1f} px/s  (windows {min(wins):.0f}-{max(wins):.0f})"
+                  f"{'   <- best' if w == best else ''}", flush=True)
+        print(f"   speed varies by about +-{spread * 100:.0f} % by itself inside a trial: smaller differences "
+              f"between counts are noise", flush=True)
         if results[best] < 0.8 * cpu_px:
-            print(f"   (below the CPU's {cpu_px:.0f} px/s: the network or the server is the limit here, "
-                  f"not your CPU; more workers did not help)", flush=True)
+            print(f"   (below the CPU's {cpu_px:.0f} px/s measured in a short burst: the CPU slowing down "
+                  f"under long load, the network or the server is the limit, not the worker count)", flush=True)
 
     if args.no_save:
         print(f"not saved; use --workers {best}")
@@ -205,7 +278,8 @@ def main():
     tuning = engine._tuning()
     tuning.update({"workers": best, "workers_tuned": {
         "date": time.strftime("%Y-%m-%d %H:%M"), "estimate": est, "live_px_per_s": results,
-        "round_trip_ms": round(busy[0] * 1000), "cpu_fresh_px_per_s": round(cpu_px)}})
+        "trial_s": None if args.quick else args.seconds, "round_trip_ms": round(busy[0] * 1000),
+        "cpu_fresh_px_per_s": round(cpu_px)}})
     os.makedirs(os.path.dirname(engine.TUNING_FILE), exist_ok=True)
     with open(engine.TUNING_FILE, "w") as f:
         json.dump(tuning, f, indent=1)
