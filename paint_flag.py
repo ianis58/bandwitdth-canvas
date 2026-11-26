@@ -147,28 +147,36 @@ def run_pass(pool, tasks, label):
     return counts
 
 
-def main():
-    ap = argparse.ArgumentParser(description="Paint and guard a French flag on the canvas.")
-    ap.add_argument("--x", type=int, default=877)
-    ap.add_argument("--y", type=int, default=491)
+def add_common_args(ap, x, y):
+    """Options shared by paint_flag.py and paint_croissant_flag.py."""
+    ap.add_argument("--x", type=int, default=x)
+    ap.add_argument("--y", type=int, default=y)
     ap.add_argument("--width", type=int, default=147)
-    ap.add_argument("--no-fox", action="store_true", help="paint the full flag, fox's sparkle area included")
+    ap.add_argument("--no-fox", action="store_true", help="also paint over the fox's area")
     ap.add_argument("--workers", type=int, default=min(48, 6 * (os.cpu_count() or 4)))
     ap.add_argument("--max-bits", type=int, default=12)
     ap.add_argument("--name", default=os.environ.get("NAME", "tricolore"))
     ap.add_argument("--fix", action="store_true", help="only repaint pixels that differ on the board")
     ap.add_argument("--guard", action="store_true", help="repair damaged pixels in a loop until Ctrl-C")
     ap.add_argument("--interval", type=float, default=30)
-    args = ap.parse_args()
 
+
+def main():
+    ap = argparse.ArgumentParser(description="Paint and guard a French flag on the canvas.")
+    add_common_args(ap, x=877, y=491)
+    args = ap.parse_args()
+    skip = set() if args.no_fox else FOX_PIXELS
+    pixels = list(flag_pixels(args.x, args.y, args.width, skip))
+    run(pixels, args, f"flag {args.width}x{round(args.width * 2 / 3)} at ({args.x},{args.y}) "
+                      f"minus {len(skip)} px left to the fox")
+
+
+def run(pixels, args, what):
+    """Paint `pixels` [(x, y, 'rrggbb')] once (--fix: only damaged ones), or guard them (--guard)."""
     cfg = requests.get(f"{BASE}/api/config", timeout=20).json()
     if cfg.get("read_only"):
         sys.exit("board is read-only")
-    skip = set() if args.no_fox else FOX_PIXELS
-    pixels = list(flag_pixels(args.x, args.y, args.width, skip))
-    print(f"flag {args.width}x{round(args.width * 2 / 3)} at ({args.x},{args.y}) "
-          f"minus {len(skip)} px left to the fox, "
-          f"name {args.name!r}, {args.workers} workers", flush=True)
+    print(f"{what}, name {args.name!r}, {args.workers} workers", flush=True)
 
     with mp.Pool(args.workers, initializer=_init,
                  initargs=(cfg["pow_kib"], args.max_bits, args.name)) as pool:
