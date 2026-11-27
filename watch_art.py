@@ -13,10 +13,13 @@ repairs it. The UI shows how much of each one is known, and "complete" once ever
 
 How an artwork is found: a painter's known pixels, with gaps of up to 6 px closed (pixels not
 painted yet, or skipped by a bot because they already had the right colour), make solid
-rectangles; each one at least --min px wide and high, with nothing else of that painter just
-outside at least 3 of its sides, is an artwork. Sparse drawings (the worm patterns) and shapes
-that are not rectangles (a character on a transparent background) are left out; two artworks
-of one painter that touch are told apart.
+rectangles. A rectangle counts when nothing else of that painter lies just outside 3 of its
+sides, or when each side has either nothing of theirs outside or a sharp colour edge (a picture
+pasted over the same painter's flag). Sparse drawings (the worm patterns) and shapes that are
+not rectangles (a character on a transparent background) are left out.
+Artworks are kept and only grow: pieces found later (from 24 px) that overlap or touch an
+artwork and fill the rectangle around both are merged into it, so a picture seen in parts
+(painted, or repaired, a piece at a time) ends up whole.
 
 Files, in artworks/ next to this script:
   index.json                     the artworks: painter, rectangle, known pixels, picture file
@@ -74,27 +77,33 @@ class Painter:
         return a
 
 
-def largest_rect(mask, min_w, min_h, accept):
-    """Biggest all-True rectangle at least min_w x min_h for which accept(x0, y0, x1, y1) is true:
-    (x0, y0, x1, y1) inclusive, or None. Every maximal rectangle is tried (histogram method)."""
+def maximal_rects(mask, min_w, min_h, accept):
+    """Every maximal all-True rectangle (can grow in no direction) at least min_w x min_h for
+    which accept(x0, y0, x1, y1) is true, as (x0, y0, x1, y1) inclusive (histogram method)."""
     H, W = mask.shape
+    rowc = np.zeros((H, W + 1), np.int64)
+    rowc[:, 1:] = mask.cumsum(1)
     heights = np.zeros(W, np.int64)
-    best, best_area = None, 0
+    found = []
     for y in range(H):
         heights = np.where(mask[y], heights + 1, 0)
         if heights.max() < min_h:
             continue
-        stack = []  # (start x, height), heights increasing
+        stack = []  # (start x, height), heights strictly increasing
         for x, h in enumerate(heights.tolist() + [0]):
             start = x
-            while stack and stack[-1][1] >= h:
+            while stack and stack[-1][1] > h:
                 sx, sh = stack.pop()
-                if sh >= min_h and x - sx >= min_w and sh * (x - sx) > best_area \
-                        and accept(sx, y - sh + 1, x - 1, y):
-                    best_area, best = sh * (x - sx), (sx, y - sh + 1, x - 1, y)
+                # widest at this height; maximal downwards if the row below is not full under it
+                if sh >= min_h and x - sx >= min_w and \
+                        (y == H - 1 or rowc[y + 1, x] - rowc[y + 1, sx] < x - sx):
+                    r = (sx, y - sh + 1, x - 1, y)
+                    if accept(*r):
+                        found.append(r)
                 start = sx
-            stack.append((start, h))
-    return best
+            if h and (not stack or stack[-1][1] < h):
+                stack.append((start, h))
+    return found
 
 
 GAP = 4  # how far outside a side we look for "nothing of the same shape there"
@@ -102,8 +111,7 @@ GAP = 4  # how far outside a side we look for "nothing of the same shape there"
 
 def side_checker(shape):
     """exposed(rect) -> [top, bottom, left, right]: True where the line GAP px outside that side
-    is (almost) free of `shape`. A real artwork is free on (nearly) all sides; a piece cut out of
-    a bigger shape (two touching artworks, a disc) is not."""
+    is (almost) free of `shape`."""
     P = np.pad(shape, GAP + 1).astype(np.int32)
     rowc = np.zeros((P.shape[0], P.shape[1] + 1), np.int32)
     rowc[:, 1:] = P.cumsum(1)
@@ -119,6 +127,36 @@ def side_checker(shape):
         right = colc[y1 + o + 1, x1 + o + GAP] - colc[y0 + o, x1 + o + GAP]
         return [top <= 0.2 * w, bottom <= 0.2 * w, left <= 0.2 * h, right <= 0.2 * h]
     return exposed
+
+
+def _rgb_diff(a, b):
+    """Mean per-channel difference of two arrays of 0xRRGGBB colours."""
+    return (np.abs((a >> 16 & 255) - (b >> 16 & 255)) + np.abs((a >> 8 & 255) - (b >> 8 & 255))
+            + np.abs((a & 255) - (b & 255))) / 3.0
+
+
+def edge_checker(cols):
+    """edges(rect) -> [top, bottom, left, right]: True where the colours change sharply across that
+    side (the painter's colours just outside vs just inside), as at the border of a picture pasted
+    over the same painter's other art. cols: the painter's colours (-1 = not seen)."""
+    H, W = cols.shape
+
+    def one(inside, outside, inner):
+        ok = (inside >= 0) & (outside >= 0) & (inner >= 0)
+        if ok.mean() < 0.3:
+            return False
+        d_out = _rgb_diff(inside[ok], outside[ok]).mean()
+        d_in = _rgb_diff(inside[ok], inner[ok]).mean()
+        return d_out >= max(25.0, 2 * d_in + 10)
+
+    def edges(x0, y0, x1, y1):
+        if y1 - y0 < 2 or x1 - x0 < 2:
+            return [False] * 4
+        return [y0 > 0 and one(cols[y0, x0:x1 + 1], cols[y0 - 1, x0:x1 + 1], cols[y0 + 1, x0:x1 + 1]),
+                y1 < H - 1 and one(cols[y1, x0:x1 + 1], cols[y1 + 1, x0:x1 + 1], cols[y1 - 1, x0:x1 + 1]),
+                x0 > 0 and one(cols[y0:y1 + 1, x0], cols[y0:y1 + 1, x0 - 1], cols[y0:y1 + 1, x0 + 1]),
+                x1 < W - 1 and one(cols[y0:y1 + 1, x1], cols[y0:y1 + 1, x1 + 1], cols[y0:y1 + 1, x1 - 1])]
+    return edges
 
 
 def grow(rect, known, free):
@@ -139,11 +177,12 @@ def grow(rect, known, free):
     return x0, y0, x1, y1
 
 
-def find_artworks(arr2d, min_size, max_per_shape=6):
-    """Rectangles (x0, y0, x1, y1) of solid known pixels, at least min_size x min_size, free of
-    the same painter's other pixels on at least 3 sides."""
+def find_pieces(arr2d, min_piece):
+    """Rectangles (x0, y0, x1, y1) of solid known pixels, at least min_piece wide and high, bounded
+    on 3 sides by nothing of the painter's, or on all 4 by nothing or by a sharp colour edge.
+    They may overlap (a picture pasted over the painter's own flag)."""
     known = arr2d >= 0
-    if known.sum() < min_size * min_size * 0.25:
+    if known.sum() < min_piece * min_piece:
         return []
     pad = 4  # so the closing does not eat into artworks touching the board's edge
     m = np.pad(known, pad)
@@ -151,23 +190,79 @@ def find_artworks(arr2d, min_size, max_per_shape=6):
     lab, _ = ndimage.label(closed)
     out = []
     for i, sl in enumerate(ndimage.find_objects(lab), 1):
-        if sl is None or sl[0].stop - sl[0].start < min_size or sl[1].stop - sl[1].start < min_size:
+        if sl is None or sl[0].stop - sl[0].start < min_piece or sl[1].stop - sl[1].start < min_piece:
             continue
-        shape = lab[sl] == i
-        exposed = side_checker(shape)
-        free_rect = shape.copy()  # where later rectangles may still go (no overlaps)
-        for _ in range(max_per_shape):
-            r = largest_rect(free_rect, min_size, min_size, lambda *r: sum(exposed(*r)) >= 3)
-            if r is None:
-                break
+        shape, cols, kn = lab[sl] == i, arr2d[sl], known[sl]
+        exposed, edges = side_checker(shape), edge_checker(cols)
+
+        def accept(*r):
+            free = exposed(*r)
+            if sum(free) >= 3:
+                return True
+            if sum(free) < 2:
+                return False
+            e = edges(*r)
+            return all(f or g for f, g in zip(free, e))
+
+        cands = sorted(set(maximal_rects(shape, min_piece, min_piece, accept)),
+                       key=lambda r: -(r[2] - r[0] + 1) * (r[3] - r[1] + 1))
+        taken = np.zeros_like(shape)
+        for r in cands[:40]:
             x0, y0, x1, y1 = r
-            free_rect[y0:y1 + 1, x0:x1 + 1] = False
-            x0, y0, x1, y1 = grow(r, known[sl], exposed(*r))
-            if known[sl][y0:y1 + 1, x0:x1 + 1].mean() >= 0.25:  # at least a quarter really seen
+            area = (x1 - x0 + 1) * (y1 - y0 + 1)
+            if taken[y0:y1 + 1, x0:x1 + 1].sum() > 0.7 * area:  # mostly inside one already kept
+                continue
+            taken[y0:y1 + 1, x0:x1 + 1] = True
+            x0, y0, x1, y1 = grow(r, kn, exposed(*r))
+            if kn[y0:y1 + 1, x0:x1 + 1].mean() >= 0.25:  # at least a quarter really seen
                 out.append((sl[1].start + x0, sl[0].start + y0, sl[1].start + x1, sl[0].start + y1))
-            if free_rect.sum() < min_size * min_size:
-                break
     return out
+
+
+def _area(r):
+    return (r[2] - r[0] + 1) * (r[3] - r[1] + 1)
+
+
+def mergeable(a, b, gap=32, fill=0.9):
+    """Two pieces of one artwork: they overlap or nearly touch, and together they (almost) fill
+    the rectangle around both."""
+    dx = max(a[0], b[0]) - min(a[2], b[2]) - 1  # gap between them (negative: they overlap)
+    dy = max(a[1], b[1]) - min(a[3], b[3]) - 1
+    if dx > gap or dy > gap:
+        return False
+    both = _area(a) + _area(b) - max(0, -dx) * max(0, -dy)
+    u = (min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3]))
+    return both >= fill * _area(u)
+
+
+def merge_rects(rects):
+    """Merge pieces of the same artwork (see mergeable) until none are left to merge."""
+    rects = list(dict.fromkeys(tuple(r) for r in rects))
+    changed = True
+    while changed:
+        changed = False
+        for i in range(len(rects)):
+            for j in range(i + 1, len(rects)):
+                a, b = rects[i], rects[j]
+                if mergeable(a, b):
+                    rects[i] = (min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3]))
+                    del rects[j]
+                    changed = True
+                    break
+            if changed:
+                break
+    return rects
+
+
+MIN_PIECE = 24  # smaller pieces count only once merged into an artwork of at least --min
+
+
+def find_artworks(arr2d, min_size, known_rects=()):
+    """The painter's artworks: pieces found now, merged with each other and with the artworks
+    already known (known_rects: they only grow), at least min_size x min_size."""
+    merged = merge_rects(list(known_rects) + find_pieces(arr2d, min(MIN_PIECE, min_size)))
+    keep = set(map(tuple, known_rects))
+    return [r for r in merged if (r[2] - r[0] + 1 >= min_size and r[3] - r[1] + 1 >= min_size) or r in keep]
 
 
 class Watcher:
@@ -221,7 +316,7 @@ class Watcher:
             arr2d = flat.reshape(self.H, self.W)
             old = {tuple(e["rect"]): e for e in self.index.get(name, [])}
             entries = []
-            for rect in find_artworks(arr2d, self.min):
+            for rect in find_artworks(arr2d, self.min, list(old)):
                 x0, y0, x1, y1 = rect
                 sub = arr2d[y0:y1 + 1, x0:x1 + 1]
                 seen, area = int((sub >= 0).sum()), sub.size
@@ -238,7 +333,11 @@ class Watcher:
                                 "png": f"artworks/{png}",
                                 "updated": time.strftime("%Y-%m-%d %H:%M:%S") if not prev or prev["seen"] != seen
                                 else prev.get("updated")})
-                if not prev:
+                grown_from = [r for r in old if r != rect and r[0] >= x0 and r[1] >= y0 and r[2] <= x1 and r[3] <= y1]
+                if not prev and grown_from:
+                    news.append(f"grown: {name or '(no name)'} {x1 - x0 + 1}x{y1 - y0 + 1} at ({x0},{y0}) "
+                                f"(merged {len(grown_from)} known piece(s) with new ones), {100 * seen / area:.0f}% known")
+                elif not prev:
                     news.append(f"new: {name or '(no name)'} {x1 - x0 + 1}x{y1 - y0 + 1} at ({x0},{y0}), "
                                 f"{100 * seen / area:.0f}% known")
                 elif seen == area and not prev.get("complete"):
