@@ -31,9 +31,10 @@ Steps:
      Each trial is also cut into 30 s windows: their lowest and highest speeds show how much it
      varies by itself (other players' load on the server, the network), so differences smaller
      than that are noise.
-     The pixels painted are intact pixels of our MERCI flag, with the colour they already have
-     (nothing visibly changes; they get a bit of heat for a few minutes, which only makes them
-     dearer for others to change). --area X0 Y0 X1 Y1 uses another area, with its current colours.
+     The pixels painted are intact pixels of our art (Justice picture, croissant flag, heart,
+     what is left of the MERCI flag), with the colour they already have (nothing visibly changes;
+     they get a bit of heat for a few minutes, which only makes them dearer for others to change).
+     --area X0 Y0 X1 Y1 uses another area, with its current colours.
   5. Keeps the fewest workers within 5 % of the best speed.
 
 Afterwards --workers N on any script, or the WORKERS environment variable, still overrides it.
@@ -107,8 +108,18 @@ def test_pixels(area):
     if area:
         x0, y0, x1, y1 = area
         return [(x, y, now(x, y)) for y in range(y0, y1 + 1) for x in range(x0, x1 + 1)]
-    import paint_merci_flag
-    return [(x, y, c) for x, y, c in paint_merci_flag.merci_pixels() if now(x, y) == c]  # intact ones only
+    return [(x, y, c) for (x, y), c in our_art().items() if now(x, y) == c]  # intact ones only
+
+
+def our_art():
+    """{(x, y): colour} of all our art at its default place (later entries win where they overlap)."""
+    import paint_croissant_flag as croissant, paint_heart, paint_image as image, paint_merci_flag
+    art = {(x, y): c for x, y, c in paint_merci_flag.merci_pixels()}
+    art.update({(x, y): c for x, y, c in paint_heart.heart_pixels(1001, 494)})
+    art.update({(x, y): c for x, y, c in croissant.croissant_flag_pixels(787, 98, 237)})
+    art.update({(x, y): c for x, y, c in image.image_pixels(image.DEFAULT_IMAGE, image.DEFAULT_RECT)})
+    art.update({(x, y): c for x, y, c in image.qr_pixels(image.qr_matrix(image.DEFAULT_QR), image.DEFAULT_RECT)})
+    return art
 
 
 class Feed:
@@ -220,7 +231,7 @@ def main():
         mins = (len(levels) * args.rounds * trial_s + args.preheat - 10) / 60
         print(f"4. live test: {levels} workers, {args.seconds:.0f} s counted each, {args.rounds} round(s): "
               f"about {mins:.0f} min{'' if fixed else ' (more if the speed still climbs at an end)'}; "
-              f"repainting intact {'area' if args.area else 'MERCI flag'} pixels with the colour they already have",
+              f"repainting intact {'area' if args.area else 'art'} pixels with the colour they already have",
               flush=True)
         runs = {}  # workers -> [(px/s, [window px/s])]
         first = True

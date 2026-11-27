@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Paint (and guard) a big French flag with a croissant, filling the free area at the top left of
-the canvas. Same options as paint_flag.py, which must sit in the same folder.
+"""Paint (and guard) a French flag with a croissant, in the free area at the top right of the
+canvas. Same options as paint_flag.py, which must sit in the same folder.
 
     pip install requests pynacl        (and python3 fastpow/build.py for ~3x faster hashing)
 
@@ -8,10 +8,13 @@ the canvas. Same options as paint_flag.py, which must sit in the same folder.
     python3 paint_croissant_flag.py           # paint every pixel once
     python3 paint_croissant_flag.py --guard   # keep repairing damaged pixels until Ctrl-C
 
-Default: x 3, y 57, 506x337 - between the board's left edge, the rainbow bar and the art on the
-right. The croissant is drawn for any --width. Previous place: --x 877 --y 672 --width 147.
+Default: x 787, y 98, 237x158 - against the board's right edge, under the cat photo and the
+taskbar clock, right above our Justice picture (paint_image.py, from y 256). The croissant is
+drawn for any --width (height = 2/3 of it). Previous places: --x 3 --y 57 --width 506 (top
+left, now covered by other art), --x 877 --y 672 --width 147.
 --no-croissant paints the plain flag. rix's "VIVE LA FRANCE" banner (vive_banner.py, board
-coordinates x 127-407, y 74-109) is painted over the flag; --no-banner leaves it out.
+coordinates x 127-407, y 74-109) is painted only where the flag covers it, i.e. at the old top
+left place; --no-banner leaves it out there too.
 """
 import argparse, math
 
@@ -149,8 +152,8 @@ def croissant_flag_pixels(ox, oy, width, skip=GIVEN_AWAY, croissant=True, banner
 
 def main():
     ap = argparse.ArgumentParser(description="Paint and guard a French flag with a croissant.")
-    add_common_args(ap, x=3, y=57)
-    ap.set_defaults(width=506)
+    add_common_args(ap, x=787, y=98)
+    ap.set_defaults(width=237)
     ap.add_argument("--no-croissant", action="store_true", help="paint the plain flag")
     ap.add_argument("--no-banner", action="store_true", help="leave out rix's VIVE LA FRANCE banner")
     args = ap.parse_args()
