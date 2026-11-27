@@ -22,6 +22,8 @@ Everything runs inside this window:
     flag, VIVE LA FRANCE MERCI flag, the Justice picture with its QR code, the cat, the heart,
     the SONY Computer Entertainment logo, plus any image dropped into art/library/). Select one, then "Place a copy..." and click where its
     top-left corner goes (or "Usual place"): it becomes a zone that the drawing paints and keeps.
+  - Stocks tab: search a company or symbol (free prices from Yahoo Finance and Nasdaq) and place a
+    live widget (price, change and chart over the last week), updated every 10 minutes.
   - Hate scanner (checkbox): reads the text on the board every 20 s and covers hater words with
     small French flags (needs tesseract: sudo apt install tesseract-ocr; pip install pytesseract
     better-profanity).
@@ -407,8 +409,8 @@ def croissant_pixels(width, ss=4):
 # =============================================================================================
 # Zones (guarded.txt): what the drawing paints and keeps
 # =============================================================================================
-KINDS = ("flag", "white", "text", "chat", "art", "croissant")
-OPT_KEYS = ("fg", "ol", "bg", "file")
+KINDS = ("flag", "white", "text", "chat", "art", "croissant", "stock")
+OPT_KEYS = ("fg", "ol", "bg", "file", "sym", "src", "cls")
 TEXT_DEFAULTS = {"fg": "ffffff", "ol": "000000", "bg": "none"}
 CHAT_LINES = 6  # messages chat_to_board.py shows; a chat zone is that many 8 px lines (+1) high
 GUARDED_HELP = """\
@@ -417,6 +419,7 @@ GUARDED_HELP = """\
 #   x0 y0 x1 y1 [off] flag|white|croissant note           French flag, plain white, flag with croissant
 #   x0 y0 x1 y1 [off] text fg=ffffff ol=000000 bg=none TEXT  text as big as fits ("|" = new line)
 #   x0 y0 x1 y1 [off] art file=artworks/placed/X.png note    a picture, top-left corner at x0 y0
+#   x0 y0 x1 y1 [off] stock sym=AAPL src=yahoo note           a live stock widget (price, last week)
 #   x0 y0 x1 y1 [off] chat note                             where chat_to_board.py shows the chat
 # "off" keeps a zone listed without painting it. Where zones overlap, the later line wins.
 """
@@ -449,7 +452,7 @@ def parse_line(line):
         kind = rest.pop(0).lower()
     while rest and "=" in rest[0] and rest[0].split("=")[0].lower() in OPT_KEYS:
         k, v = rest.pop(0).split("=", 1)
-        opts[k.lower()] = v if k.lower() == "file" else v.lower()  # file names keep their case
+        opts[k.lower()] = v if k.lower() in ("file", "sym") else v.lower()  # file names, symbols keep their case
     return Zone((x0, y0, x1, y1), " ".join(rest), kind, opts, enabled)
 
 
@@ -622,12 +625,14 @@ def art_target(zone):
     return [(x0 + int(x), y0 + int(y), "%02x%02x%02x" % tuple(c)) for x, y, c in zip(xs, ys, img[ys, xs, :3].tolist())]
 
 
-def zone_target(zone):
-    """[(x, y, colour)] the zone should show."""
+def zone_target(zone, wait=False):
+    """[(x, y, colour)] the zone should show. wait: a stock widget may wait for its data."""
     if zone.kind == "chat":  # chat_to_board.py paints it
         return []
     if zone.kind == "art":
         return art_target(zone)
+    if zone.kind == "stock":
+        return stock_target(zone, wait)
     if zone.kind != "text":
         return flag_target(zone.rect, zone.kind)
     o = {**TEXT_DEFAULTS, **zone.opts}
@@ -654,7 +659,7 @@ def zones_pixels(path=GUARDED):
     want = {}
     for zone in load_guarded(path):
         if zone.enabled:
-            for x, y, c in zone_target(zone):
+            for x, y, c in zone_target(zone, wait=True):
                 want[(x, y)] = c
     return [(x, y, c) for (x, y), c in want.items()]
 
@@ -731,6 +736,231 @@ def library_render(item, width, bg=None):
     """The item drawn `width` wide: RGB uint8 array, or RGBA where it stays transparent (those
     pixels are not painted: the board shows through). bg: 'rrggbb' to fill transparent parts."""
     return _library_render((item["kind"], item.get("file")), int(width), bg or None)
+
+
+# =============================================================================================
+# Stocks: a live widget (price, change and chart over the last week), from public APIs
+# =============================================================================================
+# Two free sources, no key needed: Yahoo Finance (any market: AAPL, AIR.PA, ^FCHI, BTC-USD...;
+# it refuses some networks) and Nasdaq (US stocks, ETFs, some indexes and crypto). Search asks
+# both; a US symbol falls back to Nasdaq when Yahoo refuses.
+STOCK_REFRESH = 600  # seconds between updates of a widget's data
+_WEB = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 "
+                      "Safari/537.36", "Accept": "application/json"}
+
+
+def _num(text):
+    return float(str(text).replace("$", "").replace(",", "").strip())
+
+
+def search_stocks(query):
+    """([dict(sym, name, exch, kind, src, cls)], [problems]) for a company name or symbol."""
+    found, problems = [], []
+    try:
+        r = requests.get("https://query1.finance.yahoo.com/v1/finance/search", headers=_WEB, timeout=15,
+                         params={"q": query, "quotesCount": 12, "newsCount": 0})
+        if r.status_code != 200:
+            raise ValueError(f"answered {r.status_code}")
+        for q in r.json().get("quotes", []):
+            if q.get("symbol"):
+                found.append(dict(sym=q["symbol"], name=q.get("shortname") or q.get("longname") or "",
+                                  exch=q.get("exchDisp", ""), kind=q.get("quoteType", "").lower(), src="yahoo", cls=""))
+    except Exception as e:
+        problems.append(f"Yahoo {e}")
+    try:
+        r = requests.get("https://api.nasdaq.com/api/autocomplete/slookup/12", headers=_WEB, timeout=15,
+                         params={"search": query})
+        if r.status_code != 200:
+            raise ValueError(f"answered {r.status_code}")
+        for d in r.json().get("data") or []:
+            if d.get("symbol"):
+                found.append(dict(sym=d["symbol"], name=d.get("name", ""), exch=d.get("exchange") or "",
+                                  kind=(d.get("asset") or "").lower(), src="nasdaq", cls=(d.get("asset") or "stocks").lower()))
+    except Exception as e:
+        problems.append(f"Nasdaq {e}")
+    seen, out = set(), []
+    for f in found:  # the same symbol from both: keep the first (Yahoo: finer chart)
+        if f["sym"].upper() not in seen:
+            seen.add(f["sym"].upper())
+            out.append(f)
+    return out, problems
+
+
+def yahoo_chart(sym):
+    r = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{requests.utils.quote(sym)}", headers=_WEB,
+                     timeout=15, params={"range": "5d", "interval": "30m"})
+    if r.status_code != 200:
+        raise ValueError(f"Yahoo answered {r.status_code}")
+    res = r.json()["chart"]["result"][0]
+    meta, ts = res["meta"], res.get("timestamp") or []
+    pts = [(t, c) for t, c in zip(ts, res["indicators"]["quote"][0]["close"]) if c is not None]
+    if not pts:
+        raise ValueError("no prices")
+    price = float(meta.get("regularMarketPrice") or pts[-1][1])
+    return dict(sym=meta.get("symbol", sym), name=meta.get("shortName") or meta.get("longName") or sym,
+                currency=meta.get("currency") or "", price=price, points=[p for _, p in pts] + [price],
+                asof=time.strftime("%m/%d %H:%M", time.localtime(meta.get("regularMarketTime") or pts[-1][0])),
+                src="yahoo")
+
+
+def nasdaq_chart(sym, cls="stocks"):
+    import datetime
+    today = datetime.date.today()
+    r = requests.get(f"https://api.nasdaq.com/api/quote/{sym}/chart", headers=_WEB, timeout=15,
+                     params={"assetclass": cls or "stocks", "fromdate": (today - datetime.timedelta(days=7)).isoformat(),
+                             "todate": today.isoformat()})
+    r.raise_for_status()
+    d = r.json().get("data")
+    if not d:
+        raise ValueError("Nasdaq does not know this symbol")
+    closes = [float(p["y"]) for p in d.get("chart") or []]  # daily closes of the last week
+    price = _num(d.get("lastSalePrice") or (closes[-1] if closes else "nan"))
+    return dict(sym=d.get("symbol", sym), name=d.get("company") or sym, currency="USD",
+                price=price, points=closes + [price], asof=(d.get("timeAsOf") or "").replace(" ET", "").strip(),
+                src="nasdaq")
+
+
+def fetch_stock(sym, src="yahoo", cls=""):
+    """dict(sym, name, currency, price, points, asof, src): price now and over the last week."""
+    if src == "yahoo":
+        try:
+            return yahoo_chart(sym)
+        except Exception:
+            if not re.fullmatch(r"[A-Z]{1,5}", sym):  # not a plain US symbol: nothing to fall back to
+                raise
+    return nasdaq_chart(sym, cls or "stocks")
+
+
+class StockFeed:
+    """Cached stock data, refreshed in the background every STOCK_REFRESH s (after a failure the
+    old data stays and a new try comes after a minute). version changes at each update."""
+
+    def __init__(self):
+        self.cache, self.pending, self.errors, self.version = {}, {}, {}, 0
+        self.lock = threading.Lock()
+
+    def data(self, sym, src="yahoo", cls="", wait=False):
+        key = (sym, src, cls)
+        with self.lock:
+            when, d = self.cache.get(key, (0, None))
+            if time.time() - when > (STOCK_REFRESH if d else 60) and key not in self.pending:
+                t = self.pending[key] = threading.Thread(target=self._fetch, args=(key,), daemon=True)
+                t.start()
+            t = self.pending.get(key)
+        if wait and t:
+            t.join(20)
+        with self.lock:
+            return self.cache.get(key, (0, None))[1]
+
+    def stamp(self, sym, src="yahoo", cls=""):
+        return self.cache.get((sym, src, cls), (0, None))[0]
+
+    def _fetch(self, key):
+        try:
+            d, err = fetch_stock(*key), None
+        except Exception as e:
+            d, err = None, f"{e.__class__.__name__}: {e}"
+        with self.lock:
+            old = self.cache.get(key, (0, None))[1]
+            self.cache[key] = (time.time(), d or old)
+            self.errors[key] = err
+            self.pending.pop(key, None)
+            self.version += 1
+
+
+STOCKS = StockFeed()
+UP, DOWN, INK, DIM, BG, EDGE = (63, 185, 80), (248, 81, 73), (230, 237, 243), (139, 148, 158), (13, 17, 23), (48, 54, 61)
+
+
+def _fmt_price(p):  # no thousands separators: in a 5x7 font a comma reads like a decimal point
+    return f"{p:.0f}" if p >= 10000 else f"{p:.2f}" if p >= 1 else f"{p:.4f}"
+
+
+def _draw_text(img, x, y, text, colour, s=1):
+    """pixfont text, s times bigger; returns the x after it."""
+    import pixfont
+    if s == 1:
+        return pixfont.draw(img, x, y, text, colour)
+    w = pixfont.width(text)
+    m = np.zeros((pixfont.HEIGHT, max(1, w), 3), np.uint8)
+    pixfont.draw(m, 0, 0, text, (255, 255, 255))
+    m = m.repeat(s, 0).repeat(s, 1)[..., 0] > 0
+    H, W = img.shape[:2]
+    m = m[:max(0, H - y), :max(0, W - x)]
+    img[y:y + m.shape[0], x:x + m.shape[1]][m] = colour
+    return x + w * s
+
+
+def _line(img, x0, y0, x1, y1, colour, t=1):
+    n = max(abs(x1 - x0), abs(y1 - y0), 1)
+    for i in range(n + 1):
+        x, y = round(x0 + (x1 - x0) * i / n), round(y0 + (y1 - y0) * i / n)
+        img[max(0, y - t // 2):y + (t + 1) // 2, max(0, x - t // 2):x + (t + 1) // 2] = colour
+
+
+def render_stock(d, w, h):
+    """The widget, w x h: symbol and price, the week's change, and the week's chart."""
+    import pixfont
+    img = np.empty((h, w, 3), np.uint8)
+    img[:] = BG
+    img[0, :], img[-1, :], img[:, 0], img[:, -1] = EDGE, EDGE, EDGE, EDGE
+    s = 2 if h >= 100 and w >= 220 else 1
+    lh = (pixfont.HEIGHT + 2) * s
+    pts = [p for p in d["points"] if p == p] or [d["price"]]
+    change = d["price"] - pts[0]
+    pct = 100 * change / pts[0] if pts[0] else 0.0
+    col = UP if change >= 0 else DOWN
+    price = _fmt_price(d["price"])
+    cur = f" {d['currency']}" if d.get("currency") and d["currency"] != "USD" else ""
+    x = _draw_text(img, 3, 3, pixfont.to_ascii(d["sym"])[:12], INK, s)
+    if pixfont.width(price + cur) * s > w - 3 - (x + 4):
+        cur = ""  # no room for the currency
+    px = max(x + 4, w - 3 - pixfont.width(price + cur) * s)  # price on the right
+    _draw_text(img, _draw_text(img, px, 3, price, INK, s), 3, cur, DIM, s)
+    y = 3 + lh
+    for r in range(3 * s):  # a small triangle: up or down
+        half = r if change >= 0 else 3 * s - 1 - r
+        img[y + 2 * s + r, 3 + 2 * s - half:3 + 2 * s + half + 1] = col
+    ax = 3
+    _draw_text(img, ax + 6 * s, y, f"{change:+.2f} {pct:+.2f}% 7d" if w >= 150 * s else f"{pct:+.2f}% 7d", col, s)
+    y += lh
+    if h >= 76 * s and d.get("name"):
+        name = pixfont.to_ascii(d["name"])
+        while name and pixfont.width(name) * s > w - 6:
+            name = name[:-1]
+        _draw_text(img, 3, y, name, DIM, s)
+        y += lh
+    top, bottom, left, right = y + 1, h - 4, 3, w - 4
+    if bottom - top >= 8 and len(pts) >= 2:
+        lo, hi = min(pts), max(pts)
+        pad = (hi - lo) * 0.1 or abs(hi) * 0.01 or 1
+        lo, hi = lo - pad, hi + pad
+        X = [left + (right - left) * i / (len(pts) - 1) for i in range(len(pts))]
+        Y = [bottom - (bottom - top) * (p - lo) / (hi - lo) for p in pts]
+        fill = tuple(int(c * 0.28 + b * 0.72) for c, b in zip(col, BG))
+        for xi in range(left, right + 1):  # area under the line
+            k = min(len(X) - 2, max(0, int((xi - left) / max(1e-9, right - left) * (len(X) - 1))))
+            f = (xi - X[k]) / max(1e-9, X[k + 1] - X[k])
+            yy = round(Y[k] + (Y[k + 1] - Y[k]) * min(1, max(0, f)))
+            img[yy:bottom + 1, xi] = fill
+        y0 = round(bottom - (bottom - top) * (pts[0] - lo) / (hi - lo))  # where the week started
+        img[y0, left:right + 1:3] = DIM
+        for i in range(len(X) - 1):
+            _line(img, round(X[i]), round(Y[i]), round(X[i + 1]), round(Y[i + 1]), col, s)
+        img[max(0, round(Y[-1]) - s):round(Y[-1]) + s + 1, max(0, right - s):right + s + 1] = INK
+    return img
+
+
+def stock_target(zone, wait=False):
+    o = zone.opts
+    d = STOCKS.data(o.get("sym", ""), o.get("src", "yahoo"), o.get("cls", ""), wait)
+    if not d:
+        return []
+    x0, y0, x1, y1 = zone.rect
+    img = render_stock(d, x1 - x0 + 1, y1 - y0 + 1)
+    hexes = [bytes(c).hex() for c in img.reshape(-1, 3).tolist()]
+    w = x1 - x0 + 1
+    return [(x0 + i % w, y0 + i // w, c) for i, c in enumerate(hexes)]
 
 
 # =============================================================================================
@@ -1430,7 +1660,8 @@ def save_settings(s):
 # =============================================================================================
 COLOURS = {"white": "ffffff", "black": "000000", "French blue": "002395", "French red": "ed2939",
            "gold": "ffd700", "none": "none"}
-DASH = {"flag": "", "croissant": "", "white": (6, 3), "text": (2, 2), "chat": (8, 2, 2, 2), "art": (12, 4)}
+DASH = {"flag": "", "croissant": "", "white": (6, 3), "text": (2, 2), "chat": (8, 2, 2, 2), "art": (12, 4),
+        "stock": (12, 4)}
 ZOOMS = (0.5, 0.75, 1, 2, 3, 4, 6, 8)
 SPIN = dict(workers=(1, 2048, 8), hash_threads=(1, 4 * (os.cpu_count() or 4), 1), max_bits=(8, 24, 1),
             batch=(100, 100000, 500), interval=(1, 600, 5))
@@ -1487,6 +1718,8 @@ class CanvasUI:
         self.queue, self.wake, self.logq = queue.Queue(), threading.Event(), queue.Queue()
         self.placing, self.ghost, self.ghost_zoom, self.thumbs = None, None, None, {}
         self.art_sel, self.lib_sel, self.arts_version = None, None, -1
+        self.calls = queue.Queue()  # work from other threads, run on the Tk thread by poll()
+        self.stock_results, self.stock_sel, self.stock_seen = [], None, -1
 
         self.drawer = Drawer(path, self.s, self.log)
         self.watcher = ArtWatcher(self.log)
@@ -1649,6 +1882,37 @@ class CanvasUI:
         tk.Label(t2, fg="#666", justify="left", wraplength=260,
                  text="Drop more pictures (png, jpg...) into art/library/ and restart to add them.").pack(
             anchor="w", pady=(8, 0))
+        # stocks
+        t3 = tk.Frame(nb)
+        nb.add(t3, text="Stocks")
+        row = tk.Frame(t3)
+        row.pack(fill="x", pady=(4, 2))
+        self.stock_q = tk.StringVar()
+        entry = tk.Entry(row, textvariable=self.stock_q, width=24)
+        entry.pack(side="left", fill="x", expand=True)
+        entry.bind("<Return>", lambda e: self.stock_search())
+        tk.Button(row, text="Search", command=self.stock_search).pack(side="left", padx=4)
+        self.stock_list = tk.Listbox(t3, width=38, height=9, exportselection=False, font=("TkFixedFont", 9))
+        self.stock_list.pack(fill="x")
+        self.stock_list.insert("end", "type a company or a symbol, then Search")
+        self.stock_list.bind("<<ListboxSelect>>", lambda e: self.on_stock_select())
+        size = tk.Frame(t3)
+        size.pack(fill="x", pady=4)
+        tk.Label(size, text="Size").pack(side="left")
+        self.stock_w, self.stock_h = tk.StringVar(value="160"), tk.StringVar(value="60")
+        tk.Spinbox(size, from_=60, to=600, increment=10, textvariable=self.stock_w, width=5).pack(side="left", padx=2)
+        tk.Label(size, text="x").pack(side="left")
+        tk.Spinbox(size, from_=24, to=400, increment=10, textvariable=self.stock_h, width=5).pack(side="left", padx=2)
+        for v in (self.stock_w, self.stock_h):
+            v.trace_add("write", lambda *a: self.show_stock())
+        self.stock_thumb = tk.Label(t3)
+        self.stock_thumb.pack(pady=4)
+        self.stock_info = tk.Label(t3, justify="left", anchor="w", wraplength=260)
+        self.stock_info.pack(fill="x")
+        tk.Button(t3, text="Place widget...", command=self.place_stock).pack(anchor="w", pady=4)
+        tk.Label(t3, fg="#666", justify="left", wraplength=260,
+                 text=f"Free, delayed prices from Yahoo Finance (any market) and Nasdaq (US). A placed widget "
+                      f"updates every {STOCK_REFRESH // 60} min; the drawing repaints what changed.").pack(anchor="w")
 
     def bind_events(self):
         c, root = self.canvas, self.root
@@ -1825,6 +2089,18 @@ class CanvasUI:
             self.recompose()
             if old != self.state:
                 self.draw_overlays()
+        while True:
+            try:
+                self.calls.get_nowait()()
+            except queue.Empty:
+                break
+        if STOCKS.version != self.stock_seen:  # new stock data: widgets re-drawn, preview updated
+            self.stock_seen = STOCKS.version
+            self.cache = {k: v for k, v in self.cache.items() if k[2] != "stock"}
+            if self.board is not None and any(z.kind == "stock" for z in self.zones):
+                self.update_state()
+                self.recompose()
+            self.show_stock()
         self.flush_logs()
         self.update_status()
         self.root.after(250, self.poll)
@@ -1852,6 +2128,8 @@ class CanvasUI:
     def arrays(self, zone):
         """(xs, ys, colours) numpy arrays of the zone's target, cached per zone."""
         k = zone.key()
+        if zone.kind == "stock":  # re-drawn when its data is updated
+            k += (STOCKS.stamp(zone.opts.get("sym", ""), zone.opts.get("src", "yahoo"), zone.opts.get("cls", "")),)
         if k not in self.cache:
             t = self.chat_sample(zone) if zone.kind == "chat" else zone_target(zone)
             H, W = self.board.shape[:2] if self.board is not None else (1024, 1024)
@@ -2123,6 +2401,8 @@ class CanvasUI:
             return rect
         if kind == "chat":  # a chat zone only changes width: its height follows the lines
             return (rect[0], rect[1], max(rect[0] + 40, x), rect[1] + self.chat_h() - 1)
+        if kind == "stock":  # the widget re-lays itself out, down to 60 x 24
+            return (rect[0], rect[1], max(rect[0] + 59, x), max(rect[1] + 23, y))
         return (rect[0], rect[1], max(rect[0] + 2, x), max(rect[1] + 2, y))  # resize from the corner
 
     def on_drag(self, e):
@@ -2295,6 +2575,82 @@ class CanvasUI:
                                      ("\ntransparent parts are not painted: the board shows through"
                                       if img.shape[2] == 4 else ""))
         self.usual_btn.configure(state="normal" if place else "disabled")
+
+    # ---------------------------------------------------------------- stocks
+    def stock_search(self):
+        q = self.stock_q.get().strip()
+        if not q:
+            return
+        self.stock_list.delete(0, "end")
+        self.stock_list.insert("end", f"searching '{q}'...")
+
+        def work():
+            try:
+                res, probs = search_stocks(q)
+            except Exception as e:
+                res, probs = [], [str(e)]
+            self.calls.put(lambda: self.show_search(res, probs))
+        threading.Thread(target=work, daemon=True).start()
+
+    def show_search(self, res, probs):
+        self.stock_results, self.stock_sel = res, None
+        self.stock_list.delete(0, "end")
+        for r in res:
+            self.stock_list.insert("end", f"{r['sym'][:9]:9s} {r['name'][:21]:21s} {r['exch'][:6]}")
+        if not res:
+            self.stock_list.insert("end", "nothing found")
+        yahoo_down = any(p.startswith("Yahoo") for p in probs)
+        self.stock_info.configure(text=("Yahoo Finance refuses this network right now: US markets only (Nasdaq)."
+                                        if yahoo_down and res else "; ".join(probs)))
+        self.show_stock()
+
+    def on_stock_select(self):
+        sel = self.stock_list.curselection()
+        self.stock_sel = self.stock_results[sel[0]] if sel and sel[0] < len(self.stock_results) else None
+        self.show_stock()
+
+    def stock_size(self):
+        try:
+            return (max(60, min(600, int(float(self.stock_w.get())))), max(24, min(400, int(float(self.stock_h.get())))))
+        except ValueError:
+            return 160, 60
+
+    def show_stock(self):
+        r = self.stock_sel
+        if not r:
+            self.stock_thumb.configure(image="")
+            return
+        d = STOCKS.data(r["sym"], r["src"], r["cls"])  # in the background; poll() calls back on news
+        if not d:
+            self.stock_thumb.configure(image="")
+            err = STOCKS.errors.get((r["sym"], r["src"], r["cls"]))
+            self.stock_info.configure(text=f"{r['sym']}: {err or 'loading...'}")
+            return
+        w, h = self.stock_size()
+        self.thumbs["stock"] = ImageTk.PhotoImage(checker_thumb(render_stock(d, w, h)))
+        self.stock_thumb.configure(image=self.thumbs["stock"])
+        pts = d["points"]
+        pct = 100 * (d["price"] - pts[0]) / pts[0] if pts and pts[0] else 0
+        self.stock_info.configure(text=f"{d['name']} ({d['sym']})\n{_fmt_price(d['price'])} {d['currency']}, "
+                                       f"{pct:+.2f}% over the last week\nas of {d['asof']}, from "
+                                       f"{'Yahoo Finance' if d['src'] == 'yahoo' else 'Nasdaq'}\nwidget {w}x{h} = {w * h:,} px")
+
+    def place_stock(self):
+        r = self.stock_sel
+        d = r and STOCKS.data(r["sym"], r["src"], r["cls"])
+        if not d:
+            messagebox.showinfo("Stock widget", "Search, select a stock and wait for its price first.", parent=self.root)
+            return
+        w, h = self.stock_size()
+
+        def commit(x, y):
+            rect = (x, y, x + w - 1, y + h - 1)
+            opts = {k: v for k, v in (("sym", r["sym"]), ("src", r["src"]), ("cls", r["cls"])) if v}
+            add_guarded(rect, f"{r['sym']} stock", self.path, "stock", opts)
+            self.sel = rect
+            self.reload_zones()
+        self.start_placing(render_stock(d, w, h), commit, f"the {r['sym']} widget",
+                           f"It updates every {STOCK_REFRESH // 60} min; the drawing repaints what changed.\n\n")
 
     # ---------------------------------------------------------------- placing a copy
     def place_board_art(self):

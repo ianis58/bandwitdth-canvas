@@ -18,6 +18,8 @@ python3 canvas.py
   "My library" has our own (French flag, croissant flag, VIVE LA FRANCE MERCI flag, Justice with
   its QR code, the cat, the tricolour heart, the SONY Computer Entertainment logo, and any picture
   dropped into `art/library/`). Place a copy anywhere with a click.
+- **Stocks**: search a company or symbol (free prices from Yahoo Finance and Nasdaq) and place a
+  live widget with its price and its last week, updated every 10 minutes.
 - **Hate scanner**: covers hater words with small flags (needs tesseract).
 - **Logs**: side panel with what the drawing, the watcher and the scanner do.
 
