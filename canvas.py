@@ -19,8 +19,8 @@ Everything runs inside this window:
   - Artworks panel (right): "Board" = rectangular artworks of other painters, found by watching
     the live feed (each painter's pixels are recorded until their artwork is known, pieces seen
     at different times are merged); "My library" = our own pictures (French flag, croissant
-    flag, VIVE LA FRANCE MERCI flag, the Justice picture with its QR code, the cat, plus any
-    image dropped into art/library/). Select one, then "Place a copy..." and click where its
+    flag, VIVE LA FRANCE MERCI flag, the Justice picture with its QR code, the cat, the heart,
+    the SONY Computer Entertainment logo, plus any image dropped into art/library/). Select one, then "Place a copy..." and click where its
     top-left corner goes (or "Usual place"): it becomes a zone that the drawing paints and keeps.
   - Hate scanner (checkbox): reads the text on the board every 20 s and covers hater words with
     small French flags (needs tesseract: sudo apt install tesseract-ocr; pip install pytesseract
@@ -667,7 +667,8 @@ LIBRARY = [  # kind: flag / croissant (drawn at any size) or image (file in art/
     dict(id="croissant", title="French flag with croissant", kind="croissant", width=237, place=(787, 98)),
     dict(id="merci", title="VIVE LA FRANCE MERCI flag", kind="image", file="merci.png", width=320, place=(105, 62)),
     dict(id="duo", title="Justice, with QR code", kind="image", file="duo.png", width=252, place=(743, 256)),
-    dict(id="cat", title="Cat", kind="image", file="cat.jpg", width=150),
+    dict(id="cat", title="Cat", kind="image", file="cat.jpg", width=250),
+    dict(id="sony", title="SONY Computer Entertainment logo", kind="image", file="sony.png", width=144, bg="ffffff"),
     dict(id="heart", title="Tricolour heart", kind="image", file="heart.png", width=20, place=(1001, 494)),
 ]
 
@@ -698,7 +699,16 @@ def library_size(item, width):
 
 
 @functools.lru_cache(maxsize=32)
-def _library_render(item_key, width):
+def library_has_alpha(file):
+    """Does this library picture have transparent parts?"""
+    try:
+        return bool((np.asarray(Image.open(os.path.join(LIB_DIR, file)).convert("RGBA"))[..., 3] < 255).any())
+    except OSError:
+        return False
+
+
+@functools.lru_cache(maxsize=32)
+def _library_render(item_key, width, bg):
     kind, file = item_key
     if kind in ("flag", "croissant"):
         h = round(width * 2 / 3)
@@ -706,16 +716,21 @@ def _library_render(item_key, width):
         for x, y, c in flag_target((0, 0, width - 1, h - 1), kind):
             a[y, x] = list(bytes.fromhex(c))
         return a
-    im = Image.open(os.path.join(LIB_DIR, file)).convert("RGB")
-    if im.size[0] != width:  # photos: smooth resize, lightly sharpened so details stay crisp
+    im = Image.open(os.path.join(LIB_DIR, file)).convert("RGBA")
+    if bg:  # transparent parts filled with this colour
+        im = Image.alpha_composite(Image.new("RGBA", im.size, "#" + bg), im)
+    if im.size[0] != width:  # smooth resize, colours lightly sharpened so details stay crisp
         im = im.resize(library_size({"kind": kind, "file": file}, width), Image.LANCZOS)
-        im = im.filter(ImageFilter.UnsharpMask(radius=1.2, percent=60, threshold=2))
-    return np.asarray(im)
+        rgb = im.convert("RGB").filter(ImageFilter.UnsharpMask(radius=1.2, percent=60, threshold=2))
+        im = Image.merge("RGBA", (*rgb.split(), im.getchannel("A")))
+    a = np.asarray(im)
+    return a if (a[..., 3] < 255).any() else np.ascontiguousarray(a[..., :3])
 
 
-def library_render(item, width):
-    """RGB uint8 array of the item drawn `width` wide."""
-    return _library_render((item["kind"], item.get("file")), int(width))
+def library_render(item, width, bg=None):
+    """The item drawn `width` wide: RGB uint8 array, or RGBA where it stays transparent (those
+    pixels are not painted: the board shows through). bg: 'rrggbb' to fill transparent parts."""
+    return _library_render((item["kind"], item.get("file")), int(width), bg or None)
 
 
 # =============================================================================================
@@ -1618,6 +1633,10 @@ class CanvasUI:
         self.lib_width.trace_add("write", lambda *a: self.show_lib())
         self.lib_size = tk.Label(size, text="")
         self.lib_size.pack(side="left")
+        self.lib_bg = tk.BooleanVar(value=False)
+        self.lib_bg_box = tk.Checkbutton(t2, text="White background (transparent parts painted white)",
+                                         variable=self.lib_bg, command=self.show_lib)
+        self.lib_bg_box.pack(anchor="w")
         self.lib_thumb = tk.Label(t2)
         self.lib_thumb.pack(pady=4)
         self.lib_info = tk.Label(t2, justify="left", anchor="w", wraplength=260)
@@ -2234,8 +2253,15 @@ class CanvasUI:
         sel = self.lib_list.curselection()
         self.lib_sel = self.lib_items[sel[0]] if sel else None
         if self.lib_sel:
+            self.lib_bg.set(bool(self.lib_sel.get("bg")))
             self.lib_width.set(str(self.lib_sel["width"]))  # triggers show_lib
         self.show_lib()
+
+    def lib_bg_colour(self):
+        it = self.lib_sel
+        if not it or it["kind"] != "image" or not library_has_alpha(it["file"]) or not self.lib_bg.get():
+            return None
+        return it.get("bg") or "ffffff"
 
     def lib_w(self):
         try:
@@ -2250,19 +2276,24 @@ class CanvasUI:
             self.lib_info.configure(text="")
             return
         w = self.lib_w()
+        alpha = it["kind"] == "image" and library_has_alpha(it["file"])
+        self.lib_bg_box.configure(state="normal" if alpha else "disabled")
         try:
-            img = library_render(it, w)
+            img = library_render(it, w, self.lib_bg_colour())
         except OSError as e:
             self.lib_info.configure(text=f"cannot read {it.get('file')}: {e}")
             return
         self.thumbs["lib"] = ImageTk.PhotoImage(checker_thumb(img))
         self.lib_thumb.configure(image=self.thumbs["lib"])
         h = img.shape[0]
-        self.lib_size.configure(text=f"{w}x{h} = {w * h:,} px")
+        n = int((img[..., 3] >= 128).sum()) if img.shape[2] == 4 else w * h
+        self.lib_size.configure(text=f"{w}x{h}, {n:,} px to paint")
         place = it.get("place")
         self.lib_info.configure(text=f"{it['title']}\n" + (f"usual place: ({place[0]},{place[1]})\n" if place else "") +
                                      ("drawn at any size; it stays resizable on the board" if it["kind"] != "image"
-                                      else "a picture: its size is fixed once placed"))
+                                      else "a picture: its size is fixed once placed") +
+                                     ("\ntransparent parts are not painted: the board shows through"
+                                      if img.shape[2] == 4 else ""))
         self.usual_btn.configure(state="normal" if place else "disabled")
 
     # ---------------------------------------------------------------- placing a copy
@@ -2288,7 +2319,7 @@ class CanvasUI:
 
     def lib_commit(self):
         it, w = self.lib_sel, self.lib_w()
-        img = library_render(it, w)
+        img = library_render(it, w, self.lib_bg_colour())
         h = img.shape[0]
 
         def commit(x, y):
@@ -2323,7 +2354,7 @@ class CanvasUI:
         h, w = img.shape[:2]
         rel = f"{PLACED}/{stem}_{x}_{y}_{time.strftime('%Y%m%d-%H%M%S')}.png"
         os.makedirs(os.path.join(HERE, PLACED), exist_ok=True)
-        Image.fromarray(np.ascontiguousarray(img[..., :3])).save(os.path.join(HERE, rel))
+        Image.fromarray(np.ascontiguousarray(img)).save(os.path.join(HERE, rel))  # RGBA keeps transparent parts
         rect = (x, y, x + w - 1, y + h - 1)
         add_guarded(rect, note, self.path, "art", {"file": rel})
         self.sel = rect
