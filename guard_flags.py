@@ -14,6 +14,8 @@ guarded.txt: one zone per line, board coordinates (inclusive); everything after 
                                                         "|" starts a new line
     x0 y0 x1 y1 chat note                               where chat_to_board.py shows the live chat
                                                         (painted by it, not by this script)
+    x0 y0 x1 y1 art file=artworks/placed/X.png note     a picture (a copy of an artwork placed with
+                                                        flag_ui.py), top-left corner at x0 y0
     x0 y0 x1 y1 off ...                                 any zone, kept in the list but not painted
   fg = text colour, ol = outline colour or none, bg = background colour or none (letters only).
 Delete a line to stop guarding that zone. Where a zone lies on our own art (MERCI flag, heart)
@@ -27,8 +29,8 @@ from paint_flag import default_workers, run
 
 GUARDED = os.path.join(os.path.dirname(os.path.abspath(__file__)), "guarded.txt")
 FLAG = ["002395", "ffffff", "ed2939"]  # official French blue, white, red
-KINDS = ("flag", "white", "text", "chat")
-OPT_KEYS = ("fg", "ol", "bg")
+KINDS = ("flag", "white", "text", "chat", "art")
+OPT_KEYS = ("fg", "ol", "bg", "file")
 TEXT_DEFAULTS = {"fg": "ffffff", "ol": "000000", "bg": "none"}
 CHAT_LINES = 6  # messages chat_to_board.py shows; a chat zone is that many 8 px lines (+1) high
 
@@ -60,7 +62,7 @@ def parse_line(line):
         kind = rest.pop(0).lower()
     while rest and "=" in rest[0] and rest[0].split("=")[0].lower() in OPT_KEYS:
         k, v = rest.pop(0).split("=", 1)
-        opts[k.lower()] = v.lower()
+        opts[k.lower()] = v if k.lower() == "file" else v.lower()  # file names keep their case
     return Zone((x0, y0, x1, y1), " ".join(rest), kind, opts, enabled)
 
 
@@ -75,7 +77,7 @@ def load_guarded(path=GUARDED):
 
 def add_guarded(rect, note, path=GUARDED, kind="flag", opts=None):
     new = not os.path.exists(path)
-    head = ("# zones kept alive by guard_flags.py: x0 y0 x1 y1 [flag|white|text] [fg= ol= bg=] note\n"
+    head = ("# zones kept alive by guard_flags.py: x0 y0 x1 y1 [flag|white|text|chat|art] [fg= ol= bg= file=] note\n"
             "# (delete a line to stop guarding that zone)\n") if new else ""
     words = [str(v) for v in rect] + ([] if kind == "flag" else [kind])
     words += [f"{k}={v}" for k, v in (opts or {}).items()] + [note.replace("#", " ").strip() or "manual"]
@@ -211,10 +213,41 @@ def text_masks(text, w, h, outline):
     return letters, ring
 
 
+@functools.lru_cache(maxsize=32)
+def _picture(path, mtime):
+    """RGBA uint8 array of a picture file (cached until the file changes)."""
+    import numpy as np
+    from PIL import Image
+    return np.asarray(Image.open(path).convert("RGBA"))
+
+
+def art_path(name):
+    """A zone's file= value, relative to this script's folder unless absolute."""
+    return name if os.path.isabs(name) else os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
+
+
+def art_target(zone, ours):
+    """Pixels of an art zone's picture (alpha >= 128), top-left at the zone's corner."""
+    import numpy as np
+    path = art_path(zone.opts.get("file", ""))
+    try:
+        img = _picture(path, os.path.getmtime(path))
+    except (OSError, ValueError):
+        return []
+    x0, y0, x1, y1 = zone.rect
+    img = img[:y1 - y0 + 1, :x1 - x0 + 1]
+    ys, xs = np.nonzero(img[..., 3] >= 128)
+    cols = img[ys, xs, :3]
+    return [(x0 + int(x), y0 + int(y), ours.get((x0 + int(x), y0 + int(y))) or "%02x%02x%02x" % tuple(c))
+            for x, y, c in zip(xs, ys, cols.tolist())]
+
+
 def zone_target(zone, ours):
     """[(x, y, colour)] the zone should show; our own art keeps its colours."""
     if zone.kind == "chat":  # chat_to_board.py paints it
         return []
+    if zone.kind == "art":
+        return art_target(zone, ours)
     if zone.kind != "text":
         return flag_target(zone.rect, ours, zone.kind)
     o = {**TEXT_DEFAULTS, **zone.opts}

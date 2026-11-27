@@ -13,15 +13,23 @@ Mouse: drag on empty board = new zone of the type chosen in the toolbar (Flag / 
        drag a zone = move it; drag the square handle of the selected zone = resize it (a text zone
        re-fits its text); the buttons above the selected zone switch its painting on/off or
        delete it; right-click a zone = delete it; wheel = zoom where the mouse is; middle-drag = pan.
-Keys:  Delete / Backspace = delete the selected zone, + / - = zoom, r = full refresh now.
+Keys:  Delete / Backspace = delete the selected zone, + / - = zoom, r = full refresh now,
+       Esc = cancel placing an artwork.
 Outlines: green = intact on the board, red = damaged, grey = painting switched off;
-solid = flag, dashed = white, dotted = text. "Preview" shows the zones as they will look.
+solid = flag, dashed = white, dotted = text, long dashes = art. "Preview" shows the zones as
+they will look.
+
+Artworks (right panel): the rectangular artworks found by watch_art.py (run it alongside), per
+painter, with how much of each is known. Select one to see it (cyan outline on the board), "Go
+to" scrolls there, "Place a copy..." shows it under the mouse: click where its top-left corner
+goes. The copy becomes an "art" zone (a picture saved in artworks/placed/) that guard_flags.py
+paints and keeps; pixels still unknown are taken from the board where the artwork is now.
 
 The view is live: pixels painted by anyone appear within about half a second (the board's own
 live feed), with a full reload every 60 s to stay in sync. Only the visible part of the board is
 drawn, so zooming and scrolling stay fast.
 """
-import argparse, asyncio, queue, threading, time
+import argparse, asyncio, json, os, queue, re, threading, time
 import tkinter as tk
 from tkinter import messagebox, simpledialog
 
@@ -30,14 +38,17 @@ from PIL import Image, ImageTk
 
 import paint_flag as engine
 import pixfont
-from guard_flags import (CHAT_LINES, GUARDED, add_guarded, load_guarded, move_guarded, our_art, remove_guarded,
-                         set_enabled, zone_target)
+from guard_flags import (CHAT_LINES, GUARDED, add_guarded, art_path, load_guarded, move_guarded, our_art,
+                         remove_guarded, set_enabled, zone_target)
 
 COLOURS = {"white": "ffffff", "black": "000000", "French blue": "002395", "French red": "ed2939",
            "gold": "ffd700", "none": "none"}
-DASH = {"flag": "", "white": (6, 3), "text": (2, 2), "chat": (8, 2, 2, 2)}
+DASH = {"flag": "", "white": (6, 3), "text": (2, 2), "chat": (8, 2, 2, 2), "art": (12, 4)}
 CHAT_H = CHAT_LINES * (pixfont.HEIGHT + 1) + 1  # chat_to_board.py: CHAT_LINES lines of the 5x7 pixel font
 WS_URL = engine.BASE.replace("https://", "wss://").replace("http://", "ws://") + "/api/ws"
+HERE = os.path.dirname(os.path.abspath(__file__))
+ART_INDEX = os.path.join(HERE, "artworks", "index.json")  # written by watch_art.py
+PLACED = "artworks/placed"  # copies placed from the UI, relative to this folder
 
 
 class TextDialog(simpledialog.Dialog):
@@ -76,6 +87,8 @@ class FlagUI:
         self.live, self.live_buf, self.lock = False, [], threading.Lock()
         self.ours = our_art()
         self.queue, self.wake = queue.Queue(), threading.Event()
+        self.arts, self.art_mtime, self.art_sel, self.art_thumb_photo = [], None, None, None
+        self.placing, self.ghost, self.ghost_zoom = None, None, None
 
         root.title("Canvas zones")
         root.geometry("1150x950")
@@ -95,6 +108,7 @@ class FlagUI:
         tk.Label(root, anchor="w", text="drag empty board = new zone   drag a zone = move   drag its corner handle = "
                                         "resize   buttons above the selected zone = on/off, delete   "
                                         "wheel = zoom at mouse   middle-drag = pan").pack(fill="x")
+        self.build_art_panel(root)
         frame = tk.Frame(root)
         frame.pack(fill="both", expand=True)
         self.canvas = c = tk.Canvas(frame, bg="#303030", highlightthickness=0)
@@ -117,6 +131,8 @@ class FlagUI:
         c.bind("<ButtonPress-2>", lambda e: c.scan_mark(e.x, e.y))
         c.bind("<B2-Motion>", lambda e: (c.scan_dragto(e.x, e.y, gain=1), self.request_render()))
         c.bind("<Configure>", lambda e: self.request_render())
+        c.bind("<Motion>", self.on_motion)
+        root.bind("<Escape>", lambda e: self.cancel_placing())
         for key in ("<Delete>", "<BackSpace>"):
             root.bind(key, lambda e: self.delete_selected())
         for key in ("<plus>", "<equal>", "<KP_Add>"):
@@ -129,6 +145,7 @@ class FlagUI:
         threading.Thread(target=self.live_loop, daemon=True).start()
         root.after(100, self.poll)
         root.after(90, self.animate)
+        root.after(500, self.poll_arts)
 
     # ---------------------------------------------------------------- board data (threads)
     def fetch_loop(self):
@@ -325,13 +342,15 @@ class FlagUI:
                 c.create_rectangle(*box, outline="white", width=2, tags="zone")
                 c.create_rectangle(*box, outline="black", width=2, dash=(4, 4), dashoffset=self.ant, tags=("zone", "ants"))
                 hx, hy = box[2], box[3]
-                c.create_rectangle(hx - 5, hy - 5, hx + 5, hy + 5, fill="yellow", outline="black", tags="zone")
+                if zone.kind != "art":  # a picture keeps its size: no resize handle
+                    c.create_rectangle(hx - 5, hy - 5, hx + 5, hy + 5, fill="yellow", outline="black", tags="zone")
                 self.add_buttons(zone, box)
             else:
                 c.create_rectangle(*box, outline=col, width=2, dash=DASH.get(zone.kind, ""), tags="zone")
             if label and (z >= 2 or zone.rect == self.sel):
                 c.create_text(box[0] + 1, box[1] - (24 if zone.rect == self.sel else 2), text=label, anchor="sw",
                               fill=col, tags="zone")
+        self.draw_art_source()
         self.update_status()
 
     def add_buttons(self, zone, box):
@@ -356,9 +375,13 @@ class FlagUI:
     def update_status(self):
         bad = sum(1 for v in self.state.values() if v is False)
         off = sum(1 for zn in self.zones if not zn.enabled)
-        kinds = {k: sum(1 for zn in self.zones if zn.kind == k) for k in ("flag", "white", "text", "chat")}
+        kinds = {k: sum(1 for zn in self.zones if zn.kind == k) for k in ("flag", "white", "text", "chat", "art")}
         mode = "live" if self.live else f"reload every {self.refresh:g} s"
-        self.status.config(text=f"{kinds['flag']} flag, {kinds['white']} white, {kinds['text']} text zone(s), "
+        if self.placing:
+            self.status.config(text="click where the artwork's top-left corner goes (Esc cancels)")
+            return
+        self.status.config(text=f"{kinds['flag']} flag, {kinds['white']} white, {kinds['text']} text, "
+                                f"{kinds['art']} art zone(s), "
                                 f"{'chat panel placed, ' if kinds['chat'] else ''}{bad} damaged, {off} off   "
                                 f"{mode}, full {self.last}   zoom {self.zoom}x")
 
@@ -386,6 +409,9 @@ class FlagUI:
     def on_press(self, e):
         if self.board is None:
             return
+        if self.placing:
+            self.finish_placing(e)
+            return
         x, y = self.board_xy(e)
         if self.on_handle(e):
             self.drag = ("resize", self.sel, (x, y))
@@ -407,6 +433,8 @@ class FlagUI:
             dx = max(-rect[0], min(W - 1 - rect[2], x - sx))
             dy = max(-rect[1], min(H - 1 - rect[3], y - sy))
             return (rect[0] + dx, rect[1] + dy, rect[2] + dx, rect[3] + dy)
+        if self.zone_kind(rect) == "art":  # a picture keeps its size
+            return rect
         if self.zone_kind(rect) == "chat":  # a chat zone only changes width: its height follows the lines
             return (rect[0], rect[1], max(rect[0] + 40, x), rect[1] + CHAT_H - 1)
         return (rect[0], rect[1], max(rect[0] + 2, x), max(rect[1] + 2, y))  # resize from the corner
@@ -476,6 +504,195 @@ class FlagUI:
             remove_guarded(self.sel, self.path)
             self.sel = None
             self.reload_zones()
+
+    # ---------------------------------------------------------------- artworks (watch_art.py)
+    def build_art_panel(self, root):
+        side = tk.Frame(root, padx=4)
+        side.pack(side="right", fill="y")
+        tk.Label(side, text="Artworks (watch_art.py)", font=("TkDefaultFont", 10, "bold")).pack(anchor="w")
+        box = tk.Frame(side)
+        box.pack(fill="both", expand=True)
+        self.art_list = tk.Listbox(box, width=36, exportselection=False, font=("TkFixedFont", 9))
+        sb = tk.Scrollbar(box, command=self.art_list.yview)
+        self.art_list.configure(yscrollcommand=sb.set)
+        self.art_list.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self.art_list.bind("<<ListboxSelect>>", lambda e: self.on_art_select())
+        self.art_list.bind("<Double-Button-1>", lambda e: self.goto_art())
+        self.art_thumb = tk.Label(side)
+        self.art_thumb.pack(pady=4)
+        self.art_info = tk.Label(side, justify="left", anchor="w", wraplength=250)
+        self.art_info.pack(fill="x")
+        row = tk.Frame(side)
+        row.pack(fill="x", pady=4)
+        tk.Button(row, text="Go to", command=self.goto_art).pack(side="left")
+        tk.Button(row, text="Place a copy...", command=self.start_placing).pack(side="left", padx=4)
+
+    def poll_arts(self):
+        """Re-read watch_art.py's list whenever it changes."""
+        try:
+            mtime = os.path.getmtime(ART_INDEX)
+        except OSError:
+            mtime = None
+        if mtime != self.art_mtime:
+            self.art_mtime = mtime
+            try:
+                with open(ART_INDEX) as f:
+                    arts = json.load(f)
+            except (OSError, ValueError):
+                arts = []
+            arts.sort(key=lambda a: (not a.get("complete"), a["name"].lower(), -a["area"]))
+            key = (self.art_sel["name"], tuple(self.art_sel["rect"])) if self.art_sel else None
+            self.arts = arts
+            self.art_list.delete(0, "end")
+            for a in arts:
+                x0, y0 = a["rect"][:2]
+                pct = 100 * a["seen"] / max(1, a["area"])
+                self.art_list.insert("end", f"{(a['name'] or '(no name)')[:14]:14s} {a['w']:>3}x{a['h']:<3} "
+                                            f"({x0},{y0}) {'done' if a.get('complete') else f'{pct:.0f}%'}")
+            if not arts:
+                self.art_list.insert("end", "none yet: run python3 watch_art.py")
+            match = [i for i, a in enumerate(arts) if (a["name"], tuple(a["rect"])) == key]
+            if match:
+                self.art_list.selection_set(match[0])
+                self.art_sel = arts[match[0]]
+                self.show_art_info()
+            elif self.art_sel:  # the selected one grew (new rectangle) or vanished
+                self.art_sel = None
+                self.show_art_info()
+        self.root.after(3000, self.poll_arts)
+
+    def art_rgba(self, a):
+        """The artwork's picture as an RGBA array (alpha 0 = pixel not known yet)."""
+        try:
+            return np.asarray(Image.open(art_path(a["png"])).convert("RGBA"))
+        except OSError:
+            return None
+
+    def on_art_select(self):
+        sel = self.art_list.curselection()
+        self.art_sel = self.arts[sel[0]] if sel and sel[0] < len(self.arts) else None
+        self.show_art_info()
+
+    def show_art_info(self):
+        a = self.art_sel
+        if not a:
+            self.art_thumb.configure(image="")
+            self.art_info.configure(text="")
+            self.draw_art_source()
+            return
+        rgba = self.art_rgba(a)
+        if rgba is not None:  # thumbnail on a grey checkerboard (unknown pixels show through)
+            h, w = rgba.shape[:2]
+            yy, xx = np.mgrid[0:h, 0:w]
+            back = np.where(((yy // 4 + xx // 4) % 2)[..., None] == 0, 90, 130).astype(np.uint8).repeat(3, 2)
+            al = rgba[..., 3:4] / 255.0
+            img = Image.fromarray((rgba[..., :3] * al + back * (1 - al)).astype(np.uint8))
+            k = min(250 / w, 190 / h, 3)
+            img = img.resize((max(1, int(w * k)), max(1, int(h * k))), Image.NEAREST)
+            self.art_thumb_photo = ImageTk.PhotoImage(img)
+            self.art_thumb.configure(image=self.art_thumb_photo)
+        x0, y0, x1, y1 = a["rect"]
+        pct = 100 * a["seen"] / max(1, a["area"])
+        self.art_info.configure(text=f"{a['name'] or '(no name)'}\n{a['w']}x{a['h']} at ({x0},{y0})-({x1},{y1})\n"
+                                     f"{a['seen']:,} of {a['area']:,} px known ({pct:.1f}%)\n" +
+                                     ("complete" if a.get("complete") else
+                                      "not complete: unknown pixels are copied from the board when placed"))
+        self.draw_art_source()
+
+    def draw_art_source(self):
+        c, z = self.canvas, self.zoom
+        c.delete("artsrc")
+        if self.art_sel:
+            x0, y0, x1, y1 = self.art_sel["rect"]
+            c.create_rectangle(x0 * z - 2, y0 * z - 2, (x1 + 1) * z + 1, (y1 + 1) * z + 1, outline="cyan", width=2,
+                               dash=(6, 3), tags="artsrc")
+
+    def goto_art(self):
+        if not self.art_sel or self.board is None:
+            return
+        x0, y0, x1, y1 = self.art_sel["rect"]
+        c, z = self.canvas, self.zoom
+        H, W = self.board.shape[:2]
+        c.xview_moveto(max(0.0, ((x0 + x1) / 2 * z - c.winfo_width() / 2) / (W * z)))
+        c.yview_moveto(max(0.0, ((y0 + y1) / 2 * z - c.winfo_height() / 2) / (H * z)))
+        self.request_render()
+        self.draw_overlays()
+
+    def start_placing(self):
+        if not self.art_sel:
+            messagebox.showinfo("Place a copy", "Select an artwork in the list first.", parent=self.root)
+            return
+        rgba = self.art_rgba(self.art_sel)
+        if rgba is None:
+            return
+        self.placing = (self.art_sel, rgba)
+        self.ghost_zoom = None
+        self.canvas.configure(cursor="crosshair")
+        self.update_status()
+
+    def cancel_placing(self):
+        self.placing = None
+        self.canvas.delete("ghost")
+        self.canvas.configure(cursor="")
+        self.update_status()
+
+    def place_xy(self, e):
+        """Top-left corner for the copy under the mouse, kept inside the board."""
+        a, rgba = self.placing
+        h, w = rgba.shape[:2]
+        H, W = self.board.shape[:2]
+        x, y = self.board_xy(e)
+        return max(0, min(W - w, x)), max(0, min(H - h, y))
+
+    def on_motion(self, e):
+        if not self.placing or self.board is None:
+            return
+        a, rgba = self.placing
+        z, c = self.zoom, self.canvas
+        if self.ghost_zoom != z:  # the picture under the mouse, at the current zoom
+            h, w = rgba.shape[:2]
+            ghost = rgba.copy()
+            ghost[..., 3] = np.where(rgba[..., 3] > 0, 200, 60)
+            self.ghost = ImageTk.PhotoImage(Image.fromarray(ghost, "RGBA").resize((w * z, h * z), Image.NEAREST))
+            self.ghost_zoom = z
+            c.delete("ghost")
+            c.create_image(0, 0, anchor="nw", image=self.ghost, tags=("ghost", "ghostimg"))
+            c.create_rectangle(0, 0, w * z, h * z, outline="yellow", width=2, tags=("ghost", "ghostbox"))
+        x, y = self.place_xy(e)
+        h, w = rgba.shape[:2]
+        c.coords("ghostimg", x * z, y * z)
+        c.coords("ghostbox", x * z - 1, y * z - 1, (x + w) * z, (y + h) * z)
+        c.tag_raise("ghost")
+
+    def finish_placing(self, e):
+        a, rgba = self.placing
+        x, y = self.place_xy(e)
+        h, w = rgba.shape[:2]
+        unknown = rgba[..., 3] < 128
+        on_ours = sum((x + i, y + j) in self.ours for j in range(h) for i in range(w))
+        if not messagebox.askyesno(
+                "Place a copy", f"Place a copy of {a['name'] or '(no name)'}'s artwork ({w}x{h}) with its top-left "
+                                f"corner at ({x},{y})?\n\n" +
+                                (f"{int(unknown.sum()):,} pixels are not known yet: they are taken from the board "
+                                 f"where the artwork is now.\n\n" if unknown.any() else "") +
+                                (f"{on_ours:,} pixels lie on our own art (MERCI flag, heart), which keeps its "
+                                 f"colours there.\n\n" if on_ours else "") +
+                                "guard_flags.py paints it on its next round.", parent=self.root):
+            return
+        img = rgba[..., :3].copy()
+        if unknown.any():
+            sx0, sy0 = a["rect"][:2]
+            img[unknown] = self.board[sy0:sy0 + h, sx0:sx0 + w][unknown]
+        name = re.sub(r"[^A-Za-z0-9_.-]", "_", a["name"]) or "noname"
+        rel = f"{PLACED}/{name}_{x}_{y}_{time.strftime('%Y%m%d-%H%M%S')}.png"
+        os.makedirs(os.path.join(HERE, PLACED), exist_ok=True)
+        Image.fromarray(img).save(os.path.join(HERE, rel))
+        rect = (x, y, x + w - 1, y + h - 1)
+        add_guarded(rect, f"copy of {a['name'] or 'noname'} art", self.path, "art", {"file": rel})
+        self.cancel_placing()
+        self.sel = rect
+        self.reload_zones()
 
     def set_zoom(self, z, anchor=None):
         """Zoom keeping the board point under `anchor` (window x, y; default: view centre) in place."""
