@@ -22,6 +22,9 @@ Everything runs inside this window:
     flag, VIVE LA FRANCE MERCI flag, the Justice picture with its QR code, the cat, the heart,
     the SONY Computer Entertainment logo, plus any image dropped into art/library/). Select one, then "Place a copy..." and click where its
     top-left corner goes (or "Usual place"): it becomes a zone that the drawing paints and keeps.
+  - Images tab: search free pictures (Openverse, Wikimedia Commons), click one, "Add to My
+    library": it is downloaded, shrunk (and its plain background removed if asked) and saved
+    into art/library/ with its author and licence, ready to place.
   - Stocks tab: search a company or symbol (free prices from Yahoo Finance and Nasdaq) and place a
     live widget (price, change and chart over the last week), updated every 10 minutes.
   - Hate scanner (checkbox): reads the text on the board every 20 s and covers hater words with
@@ -681,6 +684,7 @@ LIBRARY = [  # kind: flag / croissant (drawn at any size) or image (file in art/
 def library_items():
     """The built-in items, plus every other picture found in art/library/ (at its own size, at most 200 wide)."""
     items, known = [dict(d) for d in LIBRARY], {d.get("file") for d in LIBRARY}
+    credits = load_credits()
     try:
         files = sorted(os.listdir(LIB_DIR))
     except OSError:
@@ -691,7 +695,9 @@ def library_items():
                 w = Image.open(os.path.join(LIB_DIR, f)).size[0]
             except OSError:
                 continue
-            items.append(dict(id=f, title=os.path.splitext(f)[0], kind="image", file=f, width=min(200, w)))
+            c = credits.get(f, {})
+            items.append(dict(id=f, title=c.get("name") or os.path.splitext(f)[0], kind="image", file=f,
+                              width=min(200, w), credit=c))
     return items
 
 
@@ -736,6 +742,138 @@ def library_render(item, width, bg=None):
     """The item drawn `width` wide: RGB uint8 array, or RGBA where it stays transparent (those
     pixels are not painted: the board shows through). bg: 'rrggbb' to fill transparent parts."""
     return _library_render((item["kind"], item.get("file")), int(width), bg or None)
+
+
+# =============================================================================================
+# Image search: free pictures from Openverse and Wikimedia Commons, added to My library
+# =============================================================================================
+# Both are free and need no key; they only list openly licensed pictures (Creative Commons,
+# public domain). The author and licence of each picture added are kept in art/library/credits.json.
+_IMG_UA = {"User-Agent": "bandwitdth-canvas/1.0 (canvas image search)"}
+CREDITS = os.path.join(LIB_DIR, "credits.json")
+
+
+def _get(url, params=None, tries=3, **kw):
+    """GET, waiting a little and trying again when the server says it is busy (429)."""
+    for i in range(tries):
+        r = requests.get(url, params=params, headers=_IMG_UA, timeout=20, **kw)
+        if r.status_code != 429 or i == tries - 1:
+            return r
+        time.sleep(2 + 2 * i)
+
+
+def _strip_html(text):
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", text or "")).strip()
+
+
+def search_images(query, n=20):  # Openverse: at most 20 per page without an account
+    """([dict(title, creator, license, source, page, thumb, full, w, h)], [problems])."""
+    ov, wm, problems = [], [], []
+    try:
+        r = _get("https://api.openverse.org/v1/images/", {"q": query, "page_size": n})
+        if r.status_code != 200:
+            raise ValueError(f"answered {r.status_code}")
+        for x in r.json().get("results", []):
+            lic = (x.get("license") or "").lower()
+            lic = ("CC0" if lic == "cc0" else "Public domain" if lic == "pdm" else
+                   f"CC {lic.upper()} {x.get('license_version') or ''}".strip())
+            ov.append(dict(title=x.get("title") or "untitled", creator=x.get("creator") or "unknown", license=lic,
+                           source="Openverse", page=x.get("foreign_landing_url") or "", thumb=x.get("thumbnail") or x["url"],
+                           full=x["url"], w=x.get("width") or 0, h=x.get("height") or 0))
+    except Exception as e:
+        problems.append(f"Openverse {e}")
+    try:
+        r = _get("https://commons.wikimedia.org/w/api.php", {
+            "action": "query", "format": "json", "generator": "search", "gsrsearch": query, "gsrnamespace": 6,
+            "gsrlimit": n, "prop": "imageinfo", "iiprop": "url|size|extmetadata|mime", "iiurlwidth": 330})
+        if r.status_code != 200:
+            raise ValueError(f"answered {r.status_code}")
+        pages = (r.json().get("query") or {}).get("pages", {})
+        for pg in sorted(pages.values(), key=lambda p: p.get("index", 0)):
+            ii = (pg.get("imageinfo") or [{}])[0]
+            if not ii.get("mime", "").startswith("image/") or not ii.get("url"):
+                continue
+            m, thumb = ii.get("extmetadata", {}), ii.get("thumburl") or ii["url"]
+            plain = ii["mime"] in ("image/jpeg", "image/png", "image/gif", "image/webp")
+            # the download: the original if it is small and a usual format, else a 500 px rendering
+            full = ii["url"] if plain and (ii.get("width") or 0) <= 500 else thumb.replace("/330px-", "/500px-")
+            wm.append(dict(title=re.sub(r"\.\w+$", "", pg.get("title", "").replace("File:", "")) or "untitled",
+                           creator=_strip_html((m.get("Artist") or {}).get("value")) or "unknown",
+                           license=_strip_html((m.get("LicenseShortName") or {}).get("value")) or "see source",
+                           source="Wikimedia Commons", page=ii.get("descriptionurl", ""), thumb=thumb, full=full,
+                           w=ii.get("width") or 0, h=ii.get("height") or 0))
+    except Exception as e:
+        problems.append(f"Wikimedia {e}")
+    mixed = [x for pair in zip(ov, wm) for x in pair] + ov[len(wm):] + wm[len(ov):]
+    return mixed, problems
+
+
+def download_picture(url, limit=20_000_000):
+    """A PIL image (first frame) from a URL."""
+    import io
+    r = _get(url, stream=True)
+    r.raise_for_status()
+    data = r.raw.read(limit + 1, decode_content=True)
+    if len(data) > limit:
+        raise ValueError("picture too big")
+    im = Image.open(io.BytesIO(data))
+    im.seek(0)
+    return im.convert("RGBA")
+
+
+def remove_background(im, tol=40):
+    """Make the plain background around a picture transparent: pixels connected to the border
+    whose colour is close to the border's usual colour."""
+    from scipy import ndimage
+    a = np.asarray(im.convert("RGBA")).copy()
+    rgb = a[..., :3].astype(int)
+    border = np.concatenate([rgb[0], rgb[-1], rgb[:, 0], rgb[:, -1]])
+    close = (np.abs(rgb - np.median(border, axis=0)).max(axis=2) <= tol) & (a[..., 3] > 0)
+    lab, _ = ndimage.label(close)
+    edge = np.unique(np.concatenate([lab[0], lab[-1], lab[:, 0], lab[:, -1]]))
+    gone = np.isin(lab, edge[edge > 0])
+    # the soft edge around shapes (pixels half background) would leave a light halo: drop the
+    # pixels next to the removed background that are still closer to it than to the shape
+    near = ndimage.binary_dilation(gone) & ~gone
+    gone |= near & (np.abs(rgb - np.median(border, axis=0)).max(axis=2) <= 2.5 * tol)
+    a[..., 3][gone] = 0
+    return Image.fromarray(a, "RGBA")
+
+
+def convert_picture(im, max_side=400, transparent=False):
+    """Ready for the library: at most max_side px on its longest side, background removed if asked,
+    without an alpha channel when nothing is transparent."""
+    im = im.convert("RGBA")
+    if max(im.size) > max_side:
+        im.thumbnail((max_side, max_side), Image.LANCZOS)
+    if transparent:
+        im = remove_background(im)
+    return im if np.asarray(im)[..., 3].min() < 255 else im.convert("RGB")
+
+
+def load_credits():
+    try:
+        with open(CREDITS) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def add_to_library(im, name, credit):
+    """Save a converted picture into art/library/ (a free file name from `name`); returns the file name."""
+    os.makedirs(LIB_DIR, exist_ok=True)
+    stem = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")[:40] or "picture"
+    f, i = f"{stem}.png", 2
+    while os.path.exists(os.path.join(LIB_DIR, f)):
+        f, i = f"{stem}_{i}.png", i + 1
+    im.save(os.path.join(LIB_DIR, f), optimize=True)
+    credits = load_credits()
+    credits[f] = credit
+    tmp = CREDITS + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(credits, fh, indent=1)
+    os.replace(tmp, CREDITS)
+    return f
 
 
 # =============================================================================================
@@ -1867,7 +2005,7 @@ class CanvasUI:
         self.lib_size = tk.Label(size, text="")
         self.lib_size.pack(side="left")
         self.lib_bg = tk.BooleanVar(value=False)
-        self.lib_bg_box = tk.Checkbutton(t2, text="White background (transparent parts painted white)",
+        self.lib_bg_box = tk.Checkbutton(t2, text="White background (for transparent pictures)",
                                          variable=self.lib_bg, command=self.show_lib)
         self.lib_bg_box.pack(anchor="w")
         self.lib_thumb = tk.Label(t2)
@@ -1880,8 +2018,49 @@ class CanvasUI:
         self.usual_btn = tk.Button(row, text="Usual place", command=self.place_lib_usual)
         self.usual_btn.pack(side="left", padx=4)
         tk.Label(t2, fg="#666", justify="left", wraplength=260,
-                 text="Drop more pictures (png, jpg...) into art/library/ and restart to add them.").pack(
+                 text="Add pictures from the Images tab, or drop png/jpg files into art/library/.").pack(
             anchor="w", pady=(8, 0))
+        # image search
+        t4 = tk.Frame(nb)
+        nb.add(t4, text="Images")
+        row = tk.Frame(t4)
+        row.pack(fill="x", pady=(4, 2))
+        self.img_q = tk.StringVar()
+        entry = tk.Entry(row, textvariable=self.img_q, width=24)
+        entry.pack(side="left", fill="x", expand=True)
+        entry.bind("<Return>", lambda e: self.image_search())
+        tk.Button(row, text="Search", command=self.image_search).pack(side="left", padx=4)
+        grid = tk.Frame(t4)
+        grid.pack(fill="x")
+        self.img_grid = tk.Canvas(grid, width=262, height=262, bg="#202020", highlightthickness=0)
+        sb = tk.Scrollbar(grid, command=self.img_grid.yview)
+        self.img_grid.configure(yscrollcommand=sb.set)
+        self.img_grid.pack(side="left")
+        sb.pack(side="left", fill="y")
+        self.img_grid.bind("<Button-1>", self.on_image_click)
+        for ev, d in (("<Button-4>", -1), ("<Button-5>", 1)):
+            self.img_grid.bind(ev, lambda e, d=d: self.img_grid.yview_scroll(d, "units"))
+        self.img_grid.bind("<MouseWheel>", lambda e: self.img_grid.yview_scroll(-1 if e.delta > 0 else 1, "units"))
+        self.img_thumb = tk.Label(t4)
+        self.img_thumb.pack(pady=4)
+        self.img_info = tk.Label(t4, justify="left", anchor="w", wraplength=260)
+        self.img_info.pack(fill="x")
+        row = tk.Frame(t4)
+        row.pack(fill="x", pady=2)
+        tk.Label(row, text="Name").pack(side="left")
+        self.img_name = tk.StringVar()
+        tk.Entry(row, textvariable=self.img_name, width=18).pack(side="left", padx=4)
+        tk.Label(row, text="Max").pack(side="left")
+        self.img_max = tk.StringVar(value="400")
+        tk.Spinbox(row, from_=32, to=1024, increment=50, textvariable=self.img_max, width=5).pack(side="left", padx=2)
+        self.img_transparent = tk.BooleanVar(value=False)
+        tk.Checkbutton(t4, text="Transparent background", variable=self.img_transparent,
+                       command=self.show_image).pack(anchor="w")
+        tk.Button(t4, text="Add to My library", command=self.image_add).pack(anchor="w", pady=4)
+        tk.Label(t4, fg="#666", justify="left", wraplength=260,
+                 text="Free pictures from Openverse and Wikimedia Commons (Creative Commons, public domain); "
+                      "the author and licence are kept with each one. Transparent background removes the plain "
+                      "background around a logo or a drawing.").pack(anchor="w")
         # stocks
         t3 = tk.Frame(nb)
         nb.add(t3, text="Stocks")
@@ -2569,12 +2748,152 @@ class CanvasUI:
         n = int((img[..., 3] >= 128).sum()) if img.shape[2] == 4 else w * h
         self.lib_size.configure(text=f"{w}x{h}, {n:,} px to paint")
         place = it.get("place")
-        self.lib_info.configure(text=f"{it['title']}\n" + (f"usual place: ({place[0]},{place[1]})\n" if place else "") +
+        c = it.get("credit") or {}
+        credit = (f"{c.get('title', '')[:60]}\nby {c.get('creator', '?')[:50]}, {c.get('license', '?')} "
+                  f"({c.get('source', '?')})\n" if c else "")
+        self.lib_info.configure(text=f"{it['title']}\n{credit}" + (f"usual place: ({place[0]},{place[1]})\n" if place else "") +
                                      ("drawn at any size; it stays resizable on the board" if it["kind"] != "image"
                                       else "a picture: its size is fixed once placed") +
                                      ("\ntransparent parts are not painted: the board shows through"
                                       if img.shape[2] == 4 else ""))
         self.usual_btn.configure(state="normal" if place else "disabled")
+
+    # ---------------------------------------------------------------- image search
+    CELL = 87  # thumbnail grid: 3 per row
+
+    def image_search(self):
+        q = self.img_q.get().strip()
+        if not q:
+            return
+        self.img_gen = getattr(self, "img_gen", 0) + 1
+        gen, self.img_results, self.img_sel, self.img_pics, self.img_photos = self.img_gen, [], None, {}, {}
+        self.img_grid.delete("all")
+        self.img_grid.create_text(131, 20, text=f"searching '{q}'...", fill="#ccc")
+        self.img_thumb.configure(image="")
+        self.img_info.configure(text="")
+
+        def work():
+            try:
+                res, probs = search_images(q)
+            except Exception as e:
+                res, probs = [], [str(e)]
+            self.calls.put(lambda: self.show_image_results(gen, res, probs))
+        threading.Thread(target=work, daemon=True).start()
+
+    def show_image_results(self, gen, res, probs):
+        if gen != self.img_gen:
+            return
+        self.img_results = res
+        g = self.img_grid
+        g.delete("all")
+        if not res:
+            g.create_text(131, 20, text="nothing found" + (f": {'; '.join(probs)}" if probs else ""), fill="#ccc",
+                          width=250)
+            return
+        rows = (len(res) + 2) // 3
+        g.configure(scrollregion=(0, 0, 3 * self.CELL, rows * self.CELL))
+        for i, r in enumerate(res):
+            x, y = (i % 3) * self.CELL, (i // 3) * self.CELL
+            g.create_rectangle(x + 2, y + 2, x + self.CELL - 2, y + self.CELL - 2, outline="#444", tags=f"cell{i}")
+        if probs:
+            self.img_info.configure(text="; ".join(probs) + " (the other source still answered)")
+
+        def thumb(i, url):
+            try:
+                im = download_picture(url, 5_000_000)
+            except Exception:
+                return
+            small = im.copy()
+            small.thumbnail((self.CELL - 8, self.CELL - 8), Image.LANCZOS)
+            self.calls.put(lambda: self.put_thumb(gen, i, im, small))
+        pool = ThreadPoolExecutor(4)  # gently: both sources limit how fast one may ask
+        for i, r in enumerate(res):
+            pool.submit(thumb, i, r["thumb"])
+        pool.shutdown(wait=False)
+
+    def put_thumb(self, gen, i, im, small):
+        if gen != self.img_gen:
+            return
+        self.img_pics[i] = im
+        self.img_photos[i] = ImageTk.PhotoImage(checker_thumb(np.asarray(small), self.CELL - 8, self.CELL - 8))
+        x, y = (i % 3) * self.CELL + self.CELL // 2, (i // 3) * self.CELL + self.CELL // 2
+        self.img_grid.create_image(x, y, image=self.img_photos[i], tags=f"pic{i}")
+
+    def on_image_click(self, e):
+        i = int(self.img_grid.canvasy(e.y) // self.CELL) * 3 + int(self.img_grid.canvasx(e.x) // self.CELL)
+        if not (0 <= i < len(getattr(self, "img_results", []))) or e.x >= 3 * self.CELL:
+            return
+        self.img_sel = i
+        g = self.img_grid
+        g.delete("selbox")
+        x, y = (i % 3) * self.CELL, (i // 3) * self.CELL
+        g.create_rectangle(x + 1, y + 1, x + self.CELL - 1, y + self.CELL - 1, outline="yellow", width=3, tags="selbox")
+        r = self.img_results[i]
+        self.img_name.set(re.sub(r"[^A-Za-z0-9 _-]+", " ", r["title"]).strip()[:30])
+        self.show_image()
+
+    def show_image(self):
+        i = getattr(self, "img_sel", None)
+        if i is None:
+            return
+        r, im = self.img_results[i], self.img_pics.get(i)
+        if im is not None:
+            try:
+                prev = convert_picture(im, 250, self.img_transparent.get())
+            except ImportError:
+                prev = convert_picture(im, 250)
+            self.thumbs["img"] = ImageTk.PhotoImage(checker_thumb(np.asarray(prev)))
+            self.img_thumb.configure(image=self.thumbs["img"])
+        self.img_info.configure(text=f"{r['title'][:80]}\nby {r['creator'][:60]}\n{r['license']}, {r['source']}"
+                                     + (f", {r['w']}x{r['h']}" if r["w"] else ""))
+
+    def image_add(self):
+        i = getattr(self, "img_sel", None)
+        if i is None:
+            messagebox.showinfo("Add to My library", "Search, then click a picture first.", parent=self.root)
+            return
+        r = self.img_results[i]
+        name = self.img_name.get().strip() or r["title"]
+        try:
+            side = max(32, min(1024, int(float(self.img_max.get()))))
+        except ValueError:
+            side = 400
+        transparent = self.img_transparent.get()
+        self.img_info.configure(text=f"downloading '{name}'...")
+
+        def work():
+            try:
+                try:
+                    im = download_picture(r["full"])
+                except Exception:
+                    im = self.img_pics.get(i) or download_picture(r["thumb"])  # at least the thumbnail
+                im = convert_picture(im, side, transparent)
+                credit = dict(name=name, title=r["title"], creator=r["creator"], license=r["license"],
+                              source=r["source"], page=r["page"])
+                f = add_to_library(im, name, credit)
+                self.calls.put(lambda: self.image_added(f, name, im.size, credit))
+            except Exception as e:
+                msg = f"could not add it: {e.__class__.__name__}: {e}"
+                self.calls.put(lambda: self.img_info.configure(text=msg))
+        threading.Thread(target=work, daemon=True).start()
+
+    def image_added(self, f, name, size, credit):
+        self.log(f"library: added {name} ({size[0]}x{size[1]}, {credit['license']}, by {credit['creator'][:40]}, "
+                 f"{credit['source']}) as art/library/{f}")
+        self.reload_library(select=f)
+        self.tabs.select(1)
+
+    def reload_library(self, select=None):
+        self.lib_items = library_items()
+        self.lib_list.delete(0, "end")
+        for it in self.lib_items:
+            self.lib_list.insert("end", it["title"])
+        idx = [k for k, it in enumerate(self.lib_items) if it.get("file") == select]
+        if idx:
+            self.lib_list.selection_clear(0, "end")
+            self.lib_list.selection_set(idx[0])
+            self.lib_list.see(idx[0])
+            self.on_lib_select()
 
     # ---------------------------------------------------------------- stocks
     def stock_search(self):
