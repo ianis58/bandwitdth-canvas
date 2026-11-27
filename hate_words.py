@@ -1,4 +1,4 @@
-"""Shared rules for what counts as hate (used by scan_hate.py and chat_to_board.py)."""
+"""Rules for what counts as hate on the board (used by scan_hate.py)."""
 import re
 
 from better_profanity import profanity

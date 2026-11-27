@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Show a YouTube live chat on the canvas: the latest messages, in a chat panel you place on the
-board. Needs paint_flag.py and hate_words.py in the same folder.
+board. Needs paint_flag.py, pixfont.py and guard_flags.py in the same folder.
 
-    pip install -U yt-dlp pillow numpy requests better-profanity
+    pip install -U yt-dlp pillow numpy requests
 
     python3 chat_to_board.py URL --dry-run                  # finds a spot, previews, paints nothing
     python3 chat_to_board.py URL                            # paint and keep it updated
@@ -25,9 +25,8 @@ How it works:
     French blue, message in black, on white. The panel is a ring of line slots: a new message replaces the
     oldest line and gets the ">" marker, so each message costs about one line of pixels (a
     scrolling chat would repaint the whole panel for every message).
-  - Messages that are hateful by the same rules as scan_hate.py (profanity, slurs, hostile
-    patterns) are skipped, links become [link], and characters the font cannot draw (most
-    emoji) are dropped.
+  - Every message is shown, no word is filtered. Links become [link], and characters the font
+    cannot draw (most emoji) are dropped.
   - New messages are picked up continuously: yt-dlp keeps polling YouTube (as often as YouTube
     asks, every few seconds) and appends them to its file, which this script reads every second.
     Each message is printed as it arrives, and once a minute a "listening" line says how many
@@ -44,7 +43,6 @@ from PIL import Image, ImageDraw, ImageFont
 import paint_flag as engine
 import pixfont
 from guard_flags import CHAT_LINES
-from hate_words import hateful
 
 AUTHOR, TEXT, BG, MARK = (0x00, 0x23, 0x95), (0, 0, 0), (255, 255, 255), (0xed, 0x29, 0x39)
 
@@ -167,7 +165,7 @@ def read_youtube_api(url, key, out):
 def read_demo(out):
     """Fake chat: a few quick messages, then one every few seconds, forever."""
     samples = [("Marie", "Vive la France !"), ("Tom_42", "the croissant flag was so good"),
-               ("Lukas", "hello from Germany"), ("hater99", "france sucks"),
+               ("Lukas", "hello from Germany"), ("Brenno", "oh damn they got live chat"),
                ("Ana", "bonjour tout le monde \U0001f1eb\U0001f1f7"), ("rix", "MERCI"),
                ("Jules", "look https://example.com/x"), ("Zoé", "allez les bleus")]
     for i in range(10 ** 9):
@@ -360,9 +358,9 @@ def main():
                     break
                 received, last_msg = received + 1, time.time()
                 author, msg = clean(author), clean(msg)
-                if not msg or hateful(msg) or hateful(author):
+                if not msg:  # nothing the font can draw (only emoji, for example)
                     skipped += 1
-                    print(f"  skipped {author!r}: filtered", flush=True)
+                    print(f"  skipped {author!r}: nothing drawable (emoji only?)", flush=True)
                     continue
                 panel.add(author or "?", msg)
                 shown += 1
@@ -373,7 +371,7 @@ def main():
                 ago = (f"last one {gap:.0f} s ago" if gap < 120 else f"last one {gap / 60:.0f} min ago") \
                     if last_msg else "none yet"
                 print(f"[{time.strftime('%H:%M:%S')}] listening to the chat: {received} messages so far "
-                      f"({shown} shown, {skipped} filtered), {ago}", flush=True)
+                      f"({shown} shown, {skipped} emoji-only), {ago}", flush=True)
             moved = chat_zone()
             if moved and (moved[0], moved[1], moved[2]) != (x0, y0, x1):
                 x0, y0, x1 = moved[0], moved[1], moved[2]
@@ -391,7 +389,7 @@ def main():
                     prev[y0:y1 + 1, x0:x1 + 1] = target
                     Image.fromarray(prev[max(0, y0 - 20):y1 + 21, max(0, x0 - 20):x1 + 21]).resize(
                         ((x1 - x0 + 41) * 3, (y1 - y0 + 41) * 3), Image.NEAREST).save("chat_preview.png")
-                    print(f"{shown} shown, {skipped} filtered; {len(todo)} px would be painted; "
+                    print(f"{shown} shown, {skipped} emoji-only; {len(todo)} px would be painted; "
                           f"preview saved to chat_preview.png", flush=True)
                     return
             elif todo:
