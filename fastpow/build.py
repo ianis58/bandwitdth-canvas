@@ -6,9 +6,9 @@
 Every available compiler is built with and without reference-block prefetching (and, on AVX-512
 CPUs, also AVX2-only, since some clock down under AVX-512), each build is timed on this CPU with
 all threads busy, and the fastest is kept. Then 1 vs 2 hashing threads per core is measured
-(Hyper-Threading) and the better count saved in tuning.json, which the paint scripts follow. The library is only kept
-if its hashes match a reference implementation (PyNaCl or argon2-cffi).
-paint_flag.py and the other scripts pick it up automatically from this folder.
+(Hyper-Threading) and the better count saved in tuning.json, which canvas.py uses as its default
+"Hash threads". The library is only kept if its hashes match a reference implementation (PyNaCl or
+argon2-cffi). canvas.py and chat_to_board.py pick it up automatically from this folder.
 """
 import ctypes, json, os, platform, random, shutil, subprocess, sys, threading, time
 
@@ -60,7 +60,7 @@ def _speed(path, threads, seconds=1.5):
 def compile_lib():
     """Build every compiler x instruction set (native, and AVX2-only on AVX-512 CPUs) x prefetch,
     time each with all threads busy, keep the fastest; then choose how many threads should hash
-    at once (physical cores or all threads) and save it in tuning.json for the paint scripts."""
+    at once (physical cores or all threads) and save it in tuning.json for canvas.py."""
     out = os.path.join(HERE, LIBNAME)
     srcs = [os.path.join(HERE, "argon2_canvas.c"), os.path.join(HERE, "libargon2", "src", "blake2", "blake2b.c")]
     incs = ["-I" + os.path.join(HERE, *p) for p in ([], ["libargon2", "include"], ["libargon2", "src"])]

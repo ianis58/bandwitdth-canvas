@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Show a YouTube live chat on the canvas: the latest messages, in a chat panel you place on the
-board. Needs paint_flag.py, pixfont.py and guard_flags.py in the same folder.
+board. Needs canvas.py and pixfont.py in the same folder (it uses canvas.py's painting engine and
+reads the chat zone placed in canvas.py's window).
 
     pip install -U yt-dlp pillow numpy requests
 
@@ -9,7 +10,7 @@ board. Needs paint_flag.py, pixfont.py and guard_flags.py in the same folder.
     python3 chat_to_board.py URL --cookies-from-browser firefox   # if YouTube asks to sign in
     python3 chat_to_board.py --demo --dry-run               # fake messages
 
-Where: a "chat" zone drawn in flag_ui.py (re-read every round: move it there and the panel
+Where: a "chat" zone drawn in canvas.py's window (re-read every round: move it there and the panel
 follows), else --rect X0 Y0 X1 Y1, else (--rect auto, the default) the spot covering the least
 art, chosen at the first start and kept in chat_rect.txt (--new-spot to choose again).
 
@@ -40,9 +41,9 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-import paint_flag as engine
+import canvas as engine
 import pixfont
-from guard_flags import CHAT_LINES
+from canvas import CHAT_LINES, load_guarded
 
 AUTHOR, TEXT, BG, MARK = (0x00, 0x23, 0x95), (0, 0, 0), (255, 255, 255), (0xed, 0x29, 0x39)
 
@@ -245,15 +246,9 @@ def find_spot(board, w, h, step=2):
     k[1, 1] = 0
     structure = nonwhite & (convolve(nonwhite.astype(np.int32), k, mode="constant") >= 2)
     busy = nonwhite.astype(np.int32) + 7 * structure
-    try:
-        from guard_flags import load_guarded, our_art
-        for z in load_guarded():
-            x0, y0, x1, y1 = z.rect
-            busy[max(0, y0 - 3):y1 + 4, max(0, x0 - 3):x1 + 4] = 10 ** 6  # never on (or touching) a zone
-        for (x, y) in our_art():
-            busy[y, x] = 10 ** 6
-    except ImportError:
-        pass
+    for z in load_guarded():  # our zones (our art included)
+        x0, y0, x1, y1 = z.rect
+        busy[max(0, y0 - 3):y1 + 4, max(0, x0 - 3):x1 + 4] = 10 ** 6  # never on (or touching) a zone
     ii = np.pad(busy.cumsum(0).cumsum(1), ((1, 0), (1, 0)))
     best = None
     for y in range(2, H - h - 2, step):
@@ -288,10 +283,9 @@ def main():
     ap.add_argument("--max-bits", type=int, default=11)
     ap.add_argument("--name", default=os.environ.get("NAME", "tricolore"))
     args = ap.parse_args()
-    from guard_flags import load_guarded
 
     def chat_zone():
-        """The chat zone drawn in flag_ui.py, if any (with --rect auto only)."""
+        """The chat zone drawn in canvas.py's window, if any (with --rect auto only)."""
         if args.rect != ["auto"]:
             return None
         return next((z.rect for z in load_guarded() if z.kind == "chat" and z.enabled), None)
@@ -304,7 +298,7 @@ def main():
         x0, y0, x1, _ = chat_zone()
         panel = Panel(x1 - x0 + 1, args.lines, args.font, args.font_size)
         y1 = y0 + panel.h - 1
-        print("using the chat zone from guarded.txt (move it in flag_ui.py, the panel follows)", flush=True)
+        print("using the chat zone from guarded.txt (move it in canvas.py's window, the panel follows)", flush=True)
     else:
         panel = Panel(args.width, args.lines, args.font, args.font_size)
         saved = None

@@ -8,14 +8,11 @@ else removed, and runs the whole nonce search in C.
 ```bash
 python3 fastpow/build.py
 ```
-```bash
-python3 paint_flag.py --bench
-```
 
 `build.py` compiles for your CPU (`-march=native`, clang or gcc), checks 40 random hashes
 against PyNaCl or argon2-cffi, deletes the library if anything differs, and prints the speed.
-`paint_flag.py`, `paint_croissant_flag.py` and `paint_heart.py` then use it automatically
-(`hashing with fastpow C library (...)` in their first line). Without it they fall back to
+`canvas.py` (and `chat_to_board.py`) then use it automatically: the logs panel shows
+`fastpow C library (...)` in each drawing round's first line. Without it they fall back to
 PyNaCl (libsodium), then argon2-cffi.
 
 ## Benchmark (one core, Xeon 2.1 GHz with AVX-512, same input, µs per hash)
