@@ -33,8 +33,9 @@ Everything runs inside this window:
   - Logs (button): a side panel with what the drawing, the watcher and the scanner do.
 The YouTube chat panel stays a separate program: chat_to_board.py.
 """
-import argparse, asyncio, collections, ctypes, functools, json, math, os, queue, random, re, struct, \
-    subprocess, sys, threading, time
+import argparse, asyncio, collections, ctypes, functools, http.client, json, math, os, queue, random, re, ssl, \
+    struct, subprocess, sys, threading, time
+from urllib.parse import urlsplit
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from typing import NamedTuple
 
@@ -104,7 +105,6 @@ def _load_fast():
 
 
 _fast = _load_fast()
-_local = threading.local()  # one HTTP session per worker thread
 _kib, _max_bits, _name = 1024, 12, "tricolore"
 
 
@@ -235,11 +235,87 @@ def _init(kib, max_bits, name):
     _kib, _max_bits, _name = kib, max_bits, name
 
 
-def _sess():
-    s = getattr(_local, "s", None)
-    if s is None:
-        s = _local.s = requests.Session()
-    return s
+class FastHTTP:
+    """Keep-alive HTTPS to the canvas server with Python's own http.client, one connection per
+    thread. The paints go through it: per request it costs about 0.4 ms of CPU where `requests`
+    costs 1.6-2.5 ms, all spent holding Python's global lock, which capped one process at about
+    300 paints/s. Honours HTTPS_PROXY / NO_PROXY and the same certificate files as `requests`."""
+
+    def __init__(self, base=BASE):
+        u = urlsplit(base)
+        self.host, self.port = u.hostname, u.port or 443
+        self.ctx = ssl.create_default_context()  # system certificates (and SSL_CERT_FILE)
+        for extra in (os.environ.get("REQUESTS_CA_BUNDLE"), os.environ.get("CURL_CA_BUNDLE")):
+            if extra and os.path.exists(extra):
+                self.ctx.load_verify_locations(extra)
+        try:  # the bundle `requests` uses: covers Pythons without system certificates (macOS)
+            import certifi
+            self.ctx.load_verify_locations(certifi.where())
+        except (ImportError, OSError):
+            pass
+        self.proxy = self._proxy()
+        self.local = threading.local()
+        self.headers = {"Accept-Encoding": "identity", "User-Agent": "canvas.py", "Connection": "keep-alive"}
+
+    def _proxy(self):
+        """(host, port, auth header or None) of the HTTPS proxy to tunnel through, or None."""
+        url = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+        if not url:
+            return None
+        for entry in (os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or "").split(","):
+            e = entry.strip().lstrip(".").lower()
+            if e == "*" or (e and (self.host == e or self.host.endswith("." + e))):
+                return None
+        p = urlsplit(url if "://" in url else "http://" + url)
+        auth = None
+        if p.username:
+            import base64
+            auth = "Basic " + base64.b64encode(f"{p.username}:{p.password or ''}".encode()).decode()
+        return p.hostname, p.port or 8080, auth
+
+    def _conn(self):
+        c = getattr(self.local, "c", None)
+        if c is None:
+            if self.proxy:
+                ph, pp, auth = self.proxy
+                c = http.client.HTTPSConnection(ph, pp, timeout=20, context=self.ctx)
+                c.set_tunnel(self.host, self.port, headers={"Proxy-Authorization": auth} if auth else None)
+            else:
+                c = http.client.HTTPSConnection(self.host, self.port, timeout=20, context=self.ctx)
+            self.local.c = c
+        return c
+
+    def _drop(self):
+        c = getattr(self.local, "c", None)
+        self.local.c = None
+        if c is not None:
+            try:
+                c.close()
+            except OSError:
+                pass
+
+    def request(self, method, path, body=None):
+        """(status, body bytes). A connection the server closed is reopened once; other network
+        errors raise OSError or http.client.HTTPException."""
+        data = json.dumps(body).encode() if body is not None else None
+        headers = dict(self.headers, **({"Content-Type": "application/json"} if data is not None else {}))
+        for attempt in (0, 1):
+            c = self._conn()
+            try:
+                c.request(method, path, body=data, headers=headers)
+                r = c.getresponse()
+                payload = r.read()
+            except (OSError, http.client.HTTPException):
+                self._drop()
+                if attempt:
+                    raise
+                continue
+            if r.will_close:  # the server ends this connection: a new one next time
+                self._drop()
+            return r.status, payload
+
+
+_http = FastHTTP()
 
 
 _warned = set()
@@ -257,10 +333,15 @@ def paint_one(task):
     x, y, color = task
     x, y = int(x), int(y)  # numpy integers are not JSON serialisable
     rgb = bytes.fromhex(color)
-    session = _sess()
     for attempt in range(12):
         try:
-            c = session.get(f"{BASE}/api/challenge", params={"x": x, "y": y}, timeout=20).json()
+            status, raw = _http.request("GET", f"/api/challenge?x={x}&y={y}")
+            if status == 429:
+                time.sleep(61)
+                continue
+            if status != 200:
+                raise ValueError(f"challenge answered {status}")
+            c = json.loads(raw)
             if c["bits"] > _max_bits:
                 return (x, y, "deferred", c["bits"])
             kib = int(c.get("kib") or _kib)  # may change at any epoch: hashing with another is refused
@@ -269,19 +350,19 @@ def paint_one(task):
                            f"pip install pynacl to paint meanwhile")
                 return (x, y, "deferred", c["bits"])
             nonce = solve(bytes.fromhex(c["epoch"]), x, y, rgb, c["bits"], kib)
-            r = session.post(f"{BASE}/api/paint", timeout=20,
-                             json={"x": x, "y": y, "color": color, "epoch": c["epoch"], "nonce": nonce, "name": _name})
-        except (requests.RequestException, ValueError, KeyError):
+            status, _ = _http.request("POST", "/api/paint", {"x": x, "y": y, "color": color, "epoch": c["epoch"],
+                                                             "nonce": nonce, "name": _name})
+        except (OSError, http.client.HTTPException, ValueError, KeyError):
             time.sleep(min(30, 2 ** attempt))
             continue
-        if r.status_code == 200:
+        if status == 200:
             return (x, y, "ok", c["bits"])
-        if r.status_code == 409:  # epoch rotated or price rose while we worked: ask again
+        if status == 409:  # epoch rotated or price rose while we worked: ask again
             continue
-        if r.status_code == 429:
+        if status == 429:
             time.sleep(61)
             continue
-        if r.status_code == 403:  # board closed, or a short refusal: leave it for a later round
+        if status == 403:  # board closed, or a short refusal: leave it for a later round
             return (x, y, "refused", 0)
         time.sleep(1)
     return (x, y, "fail", 0)
